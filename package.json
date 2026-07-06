@@ -1,0 +1,27 @@
+{
+  "name": "pfa-engine",
+  "version": "1.15.0",
+  "description": "PitchFox Audio Engine — adaptive music & SFX for web games. Web Audio API based.",
+  "main": "src/index.js",
+  "module": "src/index.js",
+  "author": "PitchFox Audio",
+  "license": "MIT",
+  "keywords": [
+    "audio",
+    "adaptive-music",
+    "game-audio",
+    "sfx",
+    "sound",
+    "web-audio",
+    "interactive-music",
+    "game-engine"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pitchfoxaudio/pfa-engine-js"
+  },
+  "homepage": "https://pitchfoxaudio.com/engine",
+  "files": [
+    "src/"
+  ]
+}
