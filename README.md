@@ -414,7 +414,7 @@ Handled editor commands: `reload` (stop-all + re-fetch config + re-preload), `se
 
 - Call `pfa.init()` / `pfa.loadPack()` inside a user gesture (click/tap) — browsers block audio before one.
 - The AudioContext auto-resumes on tab visibility change; `pfa.resume()` exists for manual control.
-- Formats: OGG and MP3 decode everywhere that matters; WAV works but is heavy over the network. Studio's OGG export is the safe default.
+- Formats: OGG and MP3 decode in Chrome/Firefox/Edge; **Safari's `decodeAudioData` does not accept OGG Vorbis** — if you target Safari/iOS, export MP3 (or AAC) from Studio instead. WAV decodes everywhere but is heavy over the network. Studio's OGG export is the safe default for the other browsers.
 - The reverb worklet needs a secure context (HTTPS or `localhost`) — otherwise the engine falls back to the native-node reverb automatically.
 - Firefox uses the AudioParam fallbacks for listener positioning automatically.
 
