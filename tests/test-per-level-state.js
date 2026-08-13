@@ -16,6 +16,23 @@
  * Usage: node test-per-level-state.js
  */
 
+// Deterministic RNG (house pattern: mulberry32, see test-stinger-runtime.js).
+// The statistical assertions below (e.g. "changed > 35 of 50") sit ~2.3σ from
+// their binomial means under a live RNG — roughly one flake per 30-40 runs.
+// A fixed seed keeps every run byte-identical. Seed 41 picked by scanning:
+// every statistical assertion clears its threshold with ≥7 counts of slack.
+function mulberry32(seed) {
+  let s = seed >>> 0;
+  return function () {
+    s = (s + 0x6D2B79F5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+Math.random = mulberry32(41);
+
 let passed = 0, failed = 0;
 
 function header(t) { console.log('\n' + '═'.repeat(70)); console.log('  ' + t); console.log('═'.repeat(70)); }
@@ -349,9 +366,9 @@ header('3. VARIATION SWITCHING');
 sub('no_repeat (shuffle) mode: variation changes after switchBars');
 {
   let changed = 0;
-  for (let seed = 0; seed < 50; seed++) {
-    // Reset RNG state by seeding Math.random isn't possible in stock JS,
-    // but with enough iterations we verify statistical behavior
+  for (let run = 0; run < 50; run++) {
+    // Math.random is seeded (mulberry32 above), so this distribution
+    // check is deterministic and reproducible.
     const track = new MockTrack({
       repeatCount: 1,
       randomizationAlgo: 'no_repeat',

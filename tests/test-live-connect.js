@@ -111,6 +111,13 @@ header('1. dispatch: editor message → PFA API');
   lc._handleMessage({ type:'welcome', message:'PFA Live Connect', version:'1.0' });
   lc._handleMessage({ nottype:'no type field' });
   assert(N() === before, 'set_solo / hot_swap / config_update / unknown / welcome / typeless → zero API calls');
+
+  sub('welcome master handshake — a late-join client learns the current master');
+  lc._handleMessage({ type:'welcome', message:'PFA Live Connect', version:'1.1', master_volume:0.7 });
+  assert(JSON.stringify(pfa.calls.at(-1)) === '["setMasterVolume",0.7]',
+    'welcome WITH master_volume → setMasterVolume(volume)');
+  // The bare-welcome case (old editor, no key) stays a zero-call no-op — pinned
+  // in the ignored-types block above.
 }
 
 // ── 2. set_level contract — authored fade wins, no fade forwarded ────

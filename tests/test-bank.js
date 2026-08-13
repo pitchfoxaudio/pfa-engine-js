@@ -56,6 +56,8 @@ const BANK = path.join(AUDIO_DIR, 'footsteps.pfabank');
   const ok = await pfa.loadBank('footsteps.pfabank');
   assert(ok === true, 'loadBank() returns true on a real .pfabank');
   assert(pfa._bankMode === true, 'bank mode flag set');
+  assert(pfa._masterVolume === 1.0,
+    'bank config without master_volume → unity master (loadBank shares the loadPack intake)');
 
   const names = Object.keys(pfa.events);
   assert(names.includes('footsteps_walk') && names.includes('footsteps_run'),

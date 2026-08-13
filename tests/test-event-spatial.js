@@ -67,6 +67,10 @@ function mkStub(){
     _spawnSpatialVoice: PFA.prototype._spawnSpatialVoice,
     _scheduleSmartReloop: PFA.prototype._scheduleSmartReloop,
     _startSmartLoop: PFA.prototype._startSmartLoop,
+    // Audibility-score helpers (voice stealing, sess122) — triggerSpatial's
+    // candidate shading + the pool wrapper's score() read these off `this`.
+    _attForPosition: PFA.prototype._attForPosition,
+    _spatialVoiceScore: PFA.prototype._spatialVoiceScore,
     ctx:{ get currentTime(){return 0;},
       createStereoPanner:()=>({pan:recParam(0),connect(){}}),
       createGain:()=>({gain:recParam(1),connect(){},disconnect(){}}),
@@ -520,6 +524,30 @@ header('E2 — boundary taper: no step at max_distance');
   assert(near(_computeDistanceAttenuation(25, LIN), 1 - 0.5*24/49), 'linear mid-range unchanged');
   assert(_computeDistanceAttenuation(49.95, LIN) < 0.01,
     'linear rolloff<1 also lands at ~0 (was a 0.5-high step at the boundary)');
+}
+
+// ── E3: proximity plateau — no boost inside minDistance ──────────────
+// Inside min_distance the gain holds at EXACTLY the authored volume (1.0) —
+// industry semantics (FMOD/Wwise/Web Audio all clamp distance at the ref).
+// PIN, cross-engine contract: the Godot engine gets this same plateau by
+// pinning AudioStreamPlayer3D.max_db to each voice's volume_db (its native
+// inverse curve would otherwise BOOST by unit_size/d inside unit_size — the
+// medieval "dead live-fader + louder-than-authored fly-by" repro). Keep both
+// sides in lockstep: attenuation may only ever REDUCE a voice.
+header('E3 — plateau inside minDistance: attenuation never exceeds 1.0');
+{
+  const ATT = { model:'inverse', minDistance:5.0, maxDistance:50.0, rolloff:1.0 };
+
+  sub('inside min_distance the gain holds at the authored volume');
+  assert(_computeDistanceAttenuation(0.5, ATT) === 1.0, 'd=0.5 deep inside min 5 → 1.0 (NOT ×10 / +20 dB)');
+  assert(_computeDistanceAttenuation(5.0, ATT) === 1.0, 'd = min boundary → 1.0');
+  assert(_computeDistanceAttenuation(0, ATT) === 1.0, 'd = 0 → 1.0 (no singularity)');
+
+  sub('every model plateaus the same way');
+  for (const model of ['inverse', 'linear', 'exponential']) {
+    const a = { model, minDistance: 5.0, maxDistance: 50.0, rolloff: 1.0 };
+    assert(_computeDistanceAttenuation(1.0, a) === 1.0, `${model}: d < min → exactly 1.0`);
+  }
 }
 
 // ── summary ──────────────────────────────────────────────────────────

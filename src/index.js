@@ -495,6 +495,12 @@ class PFA {
     // Memory management: AssetStore + DecodeCache + LRU
     /** @private */ this._assetStore = {};       // { filePath: ArrayBuffer } — compressed bytes, always kept
     /** @private */ this._decodeCache = {};      // { filePath: AudioBuffer } — decoded PCM, LRU-managed
+    /** @private */ this._freshFetch = false;    // armed by a Live Connect reload — fetch with
+                                                 // {cache:'reload'}: unconditional refetch that
+                                                 // updates the HTTP cache. NOT 'no-cache': WAV
+                                                 // passthrough copies keep the SOURCE mtime, so a
+                                                 // rewrite can carry an OLDER Last-Modified and
+                                                 // mtime-based servers answer 304 to a stale entry
     /** @private */ this._decodeLRU = [];        // [ filePath, ... ] — most recently used at end
     /** @private */ this._memoryBudgetBytes = Infinity; // default: no eviction (backward compat)
     /** @private */ this._decodedBytes = 0;      // current total decoded PCM bytes in cache
@@ -912,7 +918,7 @@ class PFA {
     if (!this.ctx) this.init();
 
     try {
-      const response = await fetch(configUrl);
+      const response = await fetch(configUrl, this._freshFetch ? { cache: 'reload' } : undefined);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       this.config = await response.json();
     } catch (e) {
@@ -921,6 +927,11 @@ class PFA {
     }
 
     this.basePath = configUrl.substring(0, configUrl.lastIndexOf('/'));
+
+    // Authored master volume (exporter writes the key only when ≠ 1.0; absent ⇒
+    // unity). Config is the source of truth — a live-reload restores the authored
+    // master on BOTH engines (Godot re-reads it the same way, pfa.gd load_pack).
+    this.setMasterVolume(this.config.master_volume !== undefined ? this.config.master_volume : 1.0);
 
     // Parse groups
     this.groups = {};
@@ -1036,6 +1047,9 @@ class PFA {
     this._bankMode = true;
     delete this.config._audio_entries;
 
+    // Authored master volume (same intake as loadPack; absent ⇒ unity).
+    this.setMasterVolume(this.config.master_volume !== undefined ? this.config.master_volume : 1.0);
+
     // Parse groups (same as loadPack)
     this.groups = {};
     for (const groupData of (this.config.groups || [])) {
@@ -1067,6 +1081,12 @@ class PFA {
     this._loadReverbZones();
 
     this.loaded = true;
+
+    // Budget is documented as auto-detected by default: bank entries carry byte
+    // lengths, so engage management now, not only after preloadAll() — a lazy
+    // session must not decode a whole project at budget=Infinity (no eviction).
+    if (this._memoryBudgetBytes === Infinity) this.autoManageMemory();
+
     const bankSizeMB = (buffer.byteLength / (1024 * 1024)).toFixed(1);
     console.log(`[PFA] Bank loaded: ${bankSizeMB} MB, ${Object.keys(this.events).length} events, ${Object.keys(this._bankEntries).length} audio files`);
     return true;
@@ -1094,7 +1114,7 @@ class PFA {
       raw = this._bankBuffer.slice(absOffset, absOffset + entry.length);
     } else {
       const url = `${this.basePath}/${filePath}`;
-      const response = await fetch(url);
+      const response = await fetch(url, this._freshFetch ? { cache: 'reload' } : undefined);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       raw = await response.arrayBuffer();
     }
@@ -1114,6 +1134,23 @@ class PFA {
   releaseBankBuffer() {
     this._bankBuffer = null;
     console.log('[PFA] Bank buffer released (compressed bytes retained in asset store)');
+  }
+
+  /**
+   * Flush the in-memory audio caches so the next decode re-fetches and
+   * re-decodes. Live Connect calls this on reload: Sync rewrites exported
+   * files UNDER THE SAME NAMES, and both caches key by file path — without
+   * a flush a re-load keeps playing yesterday's audio forever.
+   * Bank mode keeps the compressed store: the bank bytes ARE the pack
+   * (Sync never rewrites a bank) and _bankBuffer may already be released,
+   * so dropping the store would strand every future re-decode.
+   * Playing voices are unaffected — they hold their own buffer references.
+   */
+  clearAudioCaches() {
+    if (!this._bankMode) this._assetStore = {};
+    this._decodeCache = {};
+    this._decodeLRU = [];
+    this._decodedBytes = 0;
   }
 
   // ── Decode Cache + LRU Memory Management ─────────────────────────────
@@ -1141,6 +1178,13 @@ class PFA {
     this._decodeCache[filePath] = audioBuffer;
     this._decodedBytes += pcmBytes;
     this._decodeLRU.push(filePath);
+
+    // Paths with no up-front sizes (loose loadPack, raw lazy decodes): engage
+    // auto-management once real decoded bytes cross 75% of the platform budget.
+    if (this._memoryBudgetBytes === Infinity &&
+        this._decodedBytes > this._getPlatformBudget() * 0.75) {
+      this.autoManageMemory();
+    }
 
     // Evict oldest if over budget
     this._evictLRU();
@@ -1294,6 +1338,11 @@ class PFA {
       concurrency = this._detectConcurrency(),
       priority = 'sfx_first',
     } = options;
+
+    // Engage the budget BEFORE decoding (estimate = compressed bytes × ~20):
+    // decoding everything first and clamping at the end leaves a transient peak
+    // of the FULL project PCM — enough to kill a mobile tab on a large bank.
+    if (this._memoryBudgetBytes === Infinity) this.autoManageMemory();
 
     // Build ordered event list
     const eventNames = Object.keys(this.events);
@@ -1737,7 +1786,10 @@ class PFA {
   duck(eventName, level = 0.0, fade = 0.5) {
     const event = this._getEvent(eventName);
     if (!event) return;
-    event._preDuckVolume = event.volume;
+    // Save the restore volume only on the FIRST duck — a re-duck without an
+    // intervening unduck must not overwrite it (Godot parity: pfa_event.gd
+    // duck() `if _duck_saved_volume < 0`), so stacked ducks restore identically.
+    if (!event._isDucked) event._preDuckVolume = event.volume;
     event._isDucked = true;
     event._duckLevel = level;
     if (event._eventGain && this.ctx) {
@@ -1927,19 +1979,28 @@ class PFA {
     if (!event) return null;
 
     if (!event.buffersLoaded) await event.loadBuffers();
-    if (!event._checkCanTrigger()) return null;
-
-    event._ensureGain();
-    event._eventGain.gain.cancelScheduledValues(0);
-    event._eventGain.gain.setValueAtTime(event.volume * event.groupGain, this._now());
 
     const cfg = _mergeSpatialConfig(config, _eventSpatialToCfg(event.spatial));
     // Per-trigger intensity / velocity (0..1) — the game passes it in the config
     // dict (config.intensity); the authored event.intensity curve maps it to a
-    // per-voice gain + pitch offset. Constant for a loop's lifetime → resolved once.
+    // per-voice gain + pitch offset. Constant for a loop's lifetime → resolved
+    // once, BEFORE the cap gate — the candidate's audibility score needs it
+    // (voice stealing, sess122).
     const iv = _intensityToGainPitch(config && config.intensity, event.intensity);
     const is3D = cfg.mode === '3D' && z != null;
     const pos = { x, y, z: z || 0 };
+
+    // Audibility gate: optimistic candidate (loudest track × intensity gain)
+    // shaded by the spawn position's own attenuation from the listener.
+    const candAmp = iv.gainMult * event._maxTrackVolume();
+    const candDist = this._attForPosition(pos, is3D ? '3D' : '2D', cfg);
+    if (!event._checkCanTrigger(candAmp, candDist, event.tracks.length)) return null;
+
+    event._ensureGain();
+    // _eventGainTarget() so a spatial one-shot fired while the event is live-ducked
+    // stays at the duck level instead of slamming _eventGain back to full.
+    event._eventGain.gain.cancelScheduledValues(0);
+    event._eventGain.gain.setValueAtTime(event._eventGainTarget(), this._now());
     // Spatial release: a no-arg voice.stop() / emitter.destroy() falls back to the
     // event's authored release_fade (HOW lives in the editor, not the game).
     // 0 ⇒ instant (unchanged default for events without an authored release).
@@ -1964,6 +2025,36 @@ class PFA {
 
     if (this.onSfxTriggered) this.onSfxTriggered(eventName);
     return voices.length > 0 ? voices[0] : null;
+  }
+
+  /**
+   * @private Distance-attenuation factor at a world position from the current
+   * listener — the audibility-score shading for steal candidates and live
+   * voices alike (voice stealing, sess122). Uses the SAME curve the web path
+   * plays (_computeDistanceAttenuation), so ranking is exactly what the mix
+   * does. No attenuation cfg ⇒ 1.0 (rank on gain alone).
+   */
+  _attForPosition(pos, mode, cfg) {
+    // No attenuation cfg / no listener state ⇒ rank on gain alone (Godot
+    // _distance_factor parity: distance unknown = factor 1).
+    if (!cfg || !cfg.attenuation || !this._listenerPos) return 1.0;
+    const s = this._worldScale;
+    const l = this._listenerPos;
+    const dist = (mode === '3D')
+      ? Math.hypot((pos.x - l.x) / s, (pos.y - l.y) / s, ((pos.z || 0) - l.z) / s)
+      : _distance2D(l.x, l.y, pos.x, pos.y, s);
+    return _computeDistanceAttenuation(dist, cfg.attenuation);
+  }
+
+  /**
+   * @private Audibility score of a live spatial voice: steady pre-amp
+   * (track × clip × rand × intensity — baked into _target at spawn) × the
+   * distance factor at its CURRENT position (emitter-followed voices move).
+   * Godot: PFASpatial._voice_score.
+   */
+  _spatialVoiceScore(voice) {
+    const amp = (voice._target != null) ? voice._target : 1.0;
+    return amp * this._attForPosition(voice._pos, voice._mode, voice._cfg);
   }
 
   /**
@@ -2040,7 +2131,20 @@ class PFA {
     voice._clipLen = clipLen;
     voice._lpf = lpfNode || null;
     this._spatialVoices.push(voice);
-    event._activeVoices.push({ stop: () => voice.stop(), isActive: () => voice.isPlaying() });
+    // Unified-pool wrapper (voice stealing): score = pre-amp × live distance
+    // factor; a releasing voice (isActive false) frees its cap slot at once and
+    // is never re-stolen. release() = the anti-click seam (stop(0) floors to
+    // SPATIAL_STOP_FLOOR_MS) — NEVER the authored release_fade: a steal is not
+    // an authored stop (sess125 defect B: authored tails kept slot-free voices
+    // audible ~574 ms past eviction, "audible ≤ cap" broke, and a smaller cap
+    // rang LOUDER than a bigger one). The authored fade stays on the no-arg
+    // stop() — game-driven stop()/destroy() paths.
+    event._activeVoices.push({
+      stop: () => voice.stop(),
+      release: () => voice.stop(0),
+      isActive: () => voice.isPlaying() && !voice._stopping,
+      score: () => this._spatialVoiceScore(voice),
+    });
 
     // Smart loop WITHOUT an emitter → voice-chained re-loop (always-plays; no
     // per-cycle play_chance). WITH an emitter, triggerSpatial drives the persistent
@@ -2240,11 +2344,14 @@ class PFAEvent {
     this.name = name;
     this.engine = engine;
     this.type = data.type || 'music';
-    this.volume = data.volume || 1.0;
+    // ?? not ||: volume 0.0 (fader at bottom) and fade_duration 0.0 (instant
+    // level switch) are authorable in the editor and must survive the parse —
+    // Godot's Dictionary.get(key, default) keeps explicit zeros the same way.
+    this.volume = data.volume ?? 1.0;
     this.groupGain = 1.0;
     this.bpm = data.bpm || 120;
     this.timeSignature = data.time_signature || [4, 4];
-    this.fadeDuration = data.fade_duration || 2.0;
+    this.fadeDuration = data.fade_duration ?? 2.0;
     this.fadeCurve = data.fade_curve || 'equal_power';
     this.switchQuantization = data.switch_quantization || 'bar';
     // Per-event Start (play) / Release (stop) fades — FMOD AHDSR-release / Wwise
@@ -2329,7 +2436,10 @@ class PFAEvent {
 
     // SFX voice management
     this._activeVoices = [];
-    this._lastTriggerTime = 0;
+    // −Infinity, not 0: a fresh event with a long cooldown must fire immediately
+    // (performance.now() − 0 < cooldownMs silently muted it for the page's first
+    // cooldown_ms of life). Godot parity: _last_trigger_time_ms init −1e12.
+    this._lastTriggerTime = -Infinity;
 
     // Fade state
     this._eventGain = null;
@@ -2352,7 +2462,7 @@ class PFAEvent {
         this._subLevelTracks[key] = {
           name: sub.name,
           levelIndex: parseInt(levelIdx),
-          volume: sub.volume || 1.0,
+          volume: sub.volume ?? 1.0,
           tracks: tracks,
         };
       }
@@ -2497,7 +2607,10 @@ class PFAEvent {
       }
       this._eventGain.gain.cancelScheduledValues(0);
       this._eventGain.gain.setValueAtTime(0.0001, now);
-      _applyFadeCurve(this._eventGain.gain, 0.0001, this.volume * this.groupGain,
+      // _eventGainTarget(): if the event was live-ducked before it (re)started,
+      // the fresh-start ramp settles at the duck level, not full (neither stop()
+      // nor play() clears _isDucked).
+      _applyFadeCurve(this._eventGain.gain, 0.0001, this._eventGainTarget(),
                        now, entryFadeDur, entryFadeCurve);
       this._playStartTime = now;
     }
@@ -2586,37 +2699,78 @@ class PFAEvent {
   }
 
   /**
-   * Check cooldown and max instances. Returns true if the event can trigger.
+   * Cooldown + max_instances gate — voice stealing by AUDIBILITY (sess122;
+   * canon = godot pfa_event._check_can_trigger + tests/test-voice-stealing.js).
+   *
+   * ONE pool per event (_activeVoices holds flat AND spatial voice wrappers).
+   * Score = pre_amp (track × clip × rand × intensity) × distance factor
+   * (spatial voices — the same curve the web path plays; flat = gain alone).
+   * A trigger spawns `spawnCount` voices (one per track), so the gate steals
+   * down to the SPAWN SIZE — live + spawnCount − cap victims must go:
+   *   • any would-be victim strictly louder than the candidate → REJECT (the
+   *     newcomer would be inaudible next to it, and must not kill a voice that
+   *     isn't) — no cooldown stamp, a rejected trigger is a non-event;
+   *   • otherwise the least audible die through their click-free release
+   *     paths. Equal scores → oldest dies (push order = chronology), byte-
+   *     parity with the old age-only steal in homogeneous scenes.
+   * cap <= 0 ⇒ uncapped. Candidate defaults are optimistic (clip volume and
+   * rand are unknown until the variation pick) so rejection stays conservative.
+   * @param {number} [candidateAmp] intensity gainMult × loudest track volume
+   * @param {number} [candidateDist] attenuation at the spawn position (flat: 1)
+   * @param {number} [spawnCount] voices this trigger will spawn (= tracks)
    * @returns {boolean}
    */
-  _checkCanTrigger() {
+  _checkCanTrigger(candidateAmp = 1.0, candidateDist = 1.0, spawnCount = 1) {
     const now = performance.now();
     if (this.cooldownMs > 0 && (now - this._lastTriggerTime) < this.cooldownMs) {
       return false;
     }
-    this._lastTriggerTime = now;
-
     this._cleanupVoices();
-    if (this._activeVoices.length >= this.maxInstances) {
-      const oldest = this._activeVoices.shift();
-      oldest.stop();
+    const cap = this.maxInstances;
+    if (cap > 0) {
+      const needed = Math.min(
+        this._activeVoices.length + spawnCount - cap, this._activeVoices.length);
+      if (needed > 0) {
+        const ranked = this._activeVoices
+          .map((v, i) => ({ v, i, score: v.score ? v.score() : 1.0 }))
+          .sort((a, b) => (a.score - b.score) || (a.i - b.i));
+        const victims = ranked.slice(0, needed);
+        if (candidateAmp * candidateDist < victims[victims.length - 1].score) {
+          return false;   // honest rejection — no stamp, nothing dies
+        }
+        for (const { v } of victims) (v.release || v.stop)();
+      }
     }
+    this._lastTriggerTime = now;
     return true;
   }
 
+  /** @private Optimistic candidate loudness base: the loudest track this trigger
+   * could spawn (clip volume / rand resolve only at the variation pick).
+   * Godot: pfa_event._max_track_volume. */
+  _maxTrackVolume() {
+    let m = 0;
+    for (const t of this.tracks) m = Math.max(m, t.volume);
+    return m > 0 ? m : 1.0;
+  }
+
   trigger(intensity) {
-    if (!this._checkCanTrigger()) return [];
+    // Intensity / velocity → per-voice gain + pitch (over the random variation).
+    // Computed ONCE here (the event owns the curve config); every track voice for
+    // this trigger gets the same offset. Neutral {1, 0} when disabled/absent.
+    // Resolved BEFORE the cap gate — the candidate's audibility score needs it
+    // (voice stealing, sess122).
+    const iv = _intensityToGainPitch(intensity, this.intensity);
+
+    if (!this._checkCanTrigger(iv.gainMult * this._maxTrackVolume(), 1.0, this.tracks.length)) return [];
 
     this._ensureGain();
     // SFX: set gain immediately (no anti-click needed for one-shots). cancel(0)
     // first so a prior fadeOut curve on this event can't trigger an overlap throw.
+    // _eventGainTarget() (not raw volume×groupGain) so a re-fired SFX honors an
+    // active live duck (mute/solo) instead of un-muting itself.
     this._eventGain.gain.cancelScheduledValues(0);
-    this._eventGain.gain.setValueAtTime(this.volume * this.groupGain, this.engine._now());
-
-    // Intensity / velocity → per-voice gain + pitch (over the random variation).
-    // Computed ONCE here (the event owns the curve config); every track voice for
-    // this trigger gets the same offset. Neutral {1, 0} when disabled/absent.
-    const iv = _intensityToGainPitch(intensity, this.intensity);
+    this._eventGain.gain.setValueAtTime(this._eventGainTarget(), this.engine._now());
 
     const played = [];
     for (const track of this.tracks) {
@@ -2809,7 +2963,9 @@ class PFAEvent {
 
   fadeIn(duration, curve = 'equal_power') {
     this._ensureGain();
-    this._tweenEventGain(this.volume * this.groupGain, duration, curve, 0.0001);
+    // _eventGainTarget() so fading an event in while it is live-ducked ramps to
+    // the duck level, not to full — the duck rides the fade.
+    this._tweenEventGain(this._eventGainTarget(), duration, curve, 0.0001);
   }
 
   fadeOut(duration, curve = 'equal_power') {
@@ -3938,13 +4094,31 @@ class PFAEvent {
     this._reverbSend.connect(eng.reverbBus.input);
   }
 
+  /**
+   * Absolute target for _eventGain that honors an active live duck (mute/solo).
+   * Godot folds the same into every voice (pfa_event.gd combined_sfx_db:2249,
+   * `ev_amp = _duck_target_amp if >= 0 else volume`); JS must too, or a re-fired
+   * SFX / spatial one-shot / fadeIn / volume re-apply lifts the live duck — the
+   * "web solo/mute muted some events but not others" regression. Not ducked →
+   * authored volume×groupGain (exact — preserves an authored 0). Ducked →
+   * duckLevel×groupGain floored to the anti-click epsilon (mirror of
+   * setGroupVolume's ducked branch, the one writer that already got this right).
+   */
+  _eventGainTarget() {
+    if (this._isDucked) {
+      const lvl = this._duckLevel !== undefined ? this._duckLevel : 0.0;
+      return Math.max(0.0001, lvl * this.groupGain);
+    }
+    return this.volume * this.groupGain;
+  }
+
   _updateGain() {
     if (this._eventGain) {
       // Instant, but guarded: clear any active fade curve first so setVolume()
       // mid-fade can't throw a curve-overlap error.
       this._eventGain.gain.cancelScheduledValues(0);
       this._eventGain.gain.setValueAtTime(
-        this.volume * this.groupGain,
+        this._eventGainTarget(),
         this.engine._now()
       );
     }
@@ -4204,9 +4378,33 @@ class PFATrack {
       : (this.levelSamples[level]?.files || this.levelSamples[0]?.files || []);
     const sample = files && files[variation] ? files[variation].split('/').pop() : null;
 
+    // Audibility score (voice stealing): the track volume lives on the shared
+    // _trackGain, not in `target` — fold it in so flat and spatial voices rank
+    // in the same units (pre_amp = track × clip × rand × intensity).
+    const preAmp = this.volume * target;
+    let releasing = false;
     return {
       stop: () => { try { source.stop(); } catch(e) {} },
-      isActive: () => this._sources.includes(source),
+      // Click-free steal: leave the pool at once (isActive false frees the cap
+      // slot), ramp the voice gain to silence over the anti-click seam, and let
+      // the source stop itself (single-owner rule — no hard cut mid-waveform).
+      release: () => {
+        if (releasing) return;
+        releasing = true;
+        try {
+          const t0 = this.engine._now();
+          voiceGain.gain.cancelScheduledValues(t0);
+          // sess125 defect A: clamp the ramp start to the spawn target — a
+          // voice younger than ~5 ms still reports the GainNode default 1.0
+          // (its scheduled envelope hasn't landed), and the envelope never
+          // exceeds `target`.
+          voiceGain.gain.setValueAtTime(Math.min(voiceGain.gain.value, target), t0);
+          voiceGain.gain.linearRampToValueAtTime(0, t0 + SPATIAL_STOP_FLOOR_MS / 1000);
+          setTimeout(() => { try { source.stop(); } catch(e) {} }, SPATIAL_STOP_FLOOR_MS + 10);
+        } catch(e) { try { source.stop(); } catch(e2) {} }
+      },
+      isActive: () => !releasing && this._sources.includes(source),
+      score: () => preAmp,
       track: this.name,
       behavior: this.levelBehavior,
       variation,
@@ -4928,7 +5126,7 @@ class PFATrack {
 class PFAGroup {
   constructor(data) {
     this.name = data.name || '';
-    this.volume = data.volume || 1.0;
+    this.volume = data.volume ?? 1.0;  // ?? — a group fader at 0.0 means silence
     this.eventNames = data.events || [];
   }
 }
@@ -5001,7 +5199,16 @@ class PFASpatialVoice {
       if (ms > 0 && this._voiceGain) {
         const ctx = this._voiceGain.context;
         const now = ctx.currentTime + 0.005;
-        const cur = this._voiceGain.gain.value;
+        // sess125 defect A: never trust a raw gain.value read for the ramp
+        // start. A voice younger than ~5 ms still reports the GainNode DEFAULT
+        // (1.0) — its scheduled quiet target hasn't landed — and the cancel
+        // below wipes that pending target, so the victim would release from
+        // FULL SCALE (+28–36 dB measured on the break shot). The voice gain
+        // never legitimately exceeds _target (envelope 0→target→0, crossfades
+        // ramp TO target), so clamp the read.
+        const cur = (this._target != null)
+          ? Math.min(this._voiceGain.gain.value, this._target)
+          : this._voiceGain.gain.value;
         // Drop any scheduled clip-fade envelope so the stop fade is clean
         this._voiceGain.gain.cancelScheduledValues(now);
         this._voiceGain.gain.setValueAtTime(cur, now);
@@ -5224,6 +5431,11 @@ class PFALiveConnect {
         this._log('[PFA Live] Reloading audio pack...');
         if (this.pfa.config) {
           const configUrl = this.pfa.basePath + '/config.json';
+          // Sync rewrites exported files under the SAME names — flush the
+          // byte/decode caches and revalidate the browser HTTP cache from
+          // here on, or the re-load keeps serving the pre-sync audio.
+          if (this.pfa.clearAudioCaches) this.pfa.clearAudioCaches();
+          this.pfa._freshFetch = true;
           this.pfa.stopAll(0.5);
           setTimeout(async () => {
             try {
@@ -5295,6 +5507,10 @@ class PFALiveConnect {
 
       case 'welcome':
         this._log(`[PFA Live] Server: ${msg.message} v${msg.version}`);
+        // Late-join master handshake: a client that connects after the editor's
+        // master fader moved learns the current value (absent on old editors ⇒
+        // no-op — the bare welcome stays a zero-call message).
+        if (msg.master_volume !== undefined) this.pfa.setMasterVolume(msg.master_volume);
         break;
     }
   }
