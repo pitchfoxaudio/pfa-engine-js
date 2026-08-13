@@ -426,7 +426,9 @@ This package versions independently from the rest of the suite (Studio 0.9.x, Go
 
 ## License
 
-MIT — free for commercial and personal use.
+**This engine is MIT** — free for commercial and personal use, no attribution required.
+
+It plays packs authored in **PFA Studio**, a separate desktop application with its own license. The Studio beta is free for everyone. For commercial projects it stays free while your total annual gross revenue and funding are under USD $200,000; at or above that, beta builds stay free until a release version ships plus a 60-day transition, then commercial use needs a release license. Beta builds are never remotely disabled, and whatever you make with the Studio stays yours in all cases (full terms in the Studio EULA). The pack format is plain JSON — the engine reads a `config.json` or a `.pfabank`, whatever produced it.
 
 - Website: [pitchfoxaudio.com](https://pitchfoxaudio.com)
 - Support the project: [Buy Me a Coffee](https://buymeacoffee.com/pitchfoxaudio)
