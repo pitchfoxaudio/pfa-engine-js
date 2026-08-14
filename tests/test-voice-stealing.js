@@ -378,6 +378,23 @@ header('9. Multitrack cap (JS): steal down to SPAWN SIZE — the cap holds');
   assert(s2 !== null, 'louder spatial trigger passes');
   assert(liveCount(ev3) <= 2,
     `spatial multitrack cap holds (live ${liveCount(ev3)} ≤ 2)`);
+
+  sub('spawn EXCEEDS cap: trigger admits nothing rather than blow past the ceiling');
+  const eng4 = mkEngine();
+  const ev4 = mkEvent(eng4, 'over', { cap: 2, tracks: 3, spatial: null });
+  const over = ev4.trigger(1.0);
+  assert(over.length === 0,
+    'live 0: a 3-voice hit cannot fit cap 2 — rejected atomically (no partial timbre)');
+  assert(liveCount(ev4) === 0, 'nothing spawned on the reject');
+  const eng5 = mkEngine();
+  const ev5 = mkEvent(eng5, 'over2', { cap: 2, tracks: 3, spatial: null });
+  ev5.maxInstances = 3;
+  const fit = ev5.trigger(1.0);
+  assert(fit.length === 3, 'same event fits exactly when cap equals its spawn size');
+  ev5.maxInstances = 2;
+  const again = ev5.trigger(1.0);
+  assert(again.length === 0 && liveCount(ev5) === 3,
+    'cap lowered below spawn: rejected, and the live voices were NOT culled for a doomed hit');
 }
 
 // ═════════════════════════════════════════════════════════════════════

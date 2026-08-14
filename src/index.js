@@ -1574,7 +1574,10 @@ class PFA {
     }
 
     if (!newEvent.buffersLoaded) await newEvent.loadBuffers();
-    newEvent.fadeIn(duration);
+    // The explicit duration must own the fresh-start entry ramp: a plain
+    // fadeIn() tween would be cancelled by play()'s own 20 ms anti-click ramp,
+    // leaving the incoming side at full volume almost instantly.
+    newEvent._entryFadeOverride = { duration, curve: 'equal_power' };
     newEvent.play();
     this.onEventStarted?.(eventName);
   }
@@ -1671,8 +1674,10 @@ class PFA {
   setLevel(eventName, level) {
     const event = this._getEvent(eventName);
     if (!event) return;
+    // onLevelChanged fires from the event's apply points — on the bar/beat path
+    // the switch happens LATER than this call, and reporting it here would hand
+    // the game a level the event hasn't reached.
     event.setLevel(level);
-    this.onLevelChanged?.(eventName, level);
   }
 
   /**
@@ -1686,12 +1691,11 @@ class PFA {
     const event = this._getEvent(eventName);
     if (!event) return false;
 
-    const result = event.navigate(trigger);
-    if (result && event.currentNode) {
-      const node = event.nodeGraph.nodes[event.currentNode];
-      this.onNodeChanged?.(eventName, event.currentNode, node?.name);
-    }
-    return result;
+    // onNodeChanged fires from _postTransitionCommon at the APPLY point — on the
+    // quantized path currentNode still holds the OLD node here, and on the
+    // instant path the apply point has already reported it (this wrapper used
+    // to double-fire).
+    return event.navigate(trigger);
   }
 
   /**
@@ -2409,6 +2413,7 @@ class PFAEvent {
     this.currentNode = null;
     this._autoAdvanceTimer = null;
     this._pendingLevelSwitch = null;  // setTimeout ID for quantized setLevel
+    this._entryFadeOverride = null;   // one-shot crossfadeTo fade-in; consumed by play()
     this._pendingNodeTransition = null;  // setTimeout ID for quantized navigate
     // Transition Kinds v2: fade_out → deferred instant-switch timer. Nulled by any
     // new _applyNodeTransition so a superseded fade_out bails at timer timeout.
@@ -2567,6 +2572,11 @@ class PFAEvent {
     this.isPlaying = true;
     this._ensureGain();
 
+    // Consume the one-shot crossfadeTo override up front: a re-press of Play must
+    // not inherit a stale override from an earlier crossfadeTo call.
+    const entryOverride = this._entryFadeOverride || null;
+    this._entryFadeOverride = null;
+
     const entryNodeId = (this.useNodes && this.nodeGraph) ? this.nodeGraph.entry_node : null;
 
     if (!wasAlreadyPlaying) {
@@ -2604,6 +2614,13 @@ class PFAEvent {
           duration: entryFadeDur,
           curve: entryFadeCurve,
         });
+      }
+      // crossfadeTo's explicit duration owns the fresh-start ramp — it must win
+      // over node/event entry fades, or the anti-click default swallows the
+      // caller's requested in-ramp.
+      if (entryOverride) {
+        entryFadeDur = entryOverride.duration ?? 0.02;
+        entryFadeCurve = entryOverride.curve ?? 'equal_power';
       }
       this._eventGain.gain.cancelScheduledValues(0);
       this._eventGain.gain.setValueAtTime(0.0001, now);
@@ -2728,8 +2745,13 @@ class PFAEvent {
     this._cleanupVoices();
     const cap = this.maxInstances;
     if (cap > 0) {
-      const needed = Math.min(
-        this._activeVoices.length + spawnCount - cap, this._activeVoices.length);
+      const needed = this._activeVoices.length + spawnCount - cap;
+      if (needed > this._activeVoices.length) {
+        // The trigger's own spawn exceeds the cap even if every live voice dies —
+        // admit nothing rather than blow past the authored polyphony ceiling
+        // (a multi-track hit is atomic; partial admission would change its timbre).
+        return false;
+      }
       if (needed > 0) {
         const ranked = this._activeVoices
           .map((v, i) => ({ v, i, score: v.score ? v.score() : 1.0 }))
@@ -2803,9 +2825,11 @@ class PFAEvent {
         const oldLevel = this.currentLevel;
         this.currentLevel = level;
         this._crossfadeLevel(oldLevel, level);
+        this.engine.onLevelChanged?.(this.name, level);
       }
     } else {
       this.currentLevel = level;
+      this.engine.onLevelChanged?.(this.name, level);
     }
   }
 
@@ -2819,6 +2843,7 @@ class PFAEvent {
       this.currentLevel = level;
       this._crossfadeLevel(oldLevel, level);
       console.log(`[PFA] Quantized setLevel: ${oldLevel} → ${level}`);
+      this.engine.onLevelChanged?.(this.name, level);
     }, Math.max(0, delay));
   }
 
@@ -3897,12 +3922,10 @@ class PFAEvent {
       const prob = conn.probability !== undefined ? conn.probability : 100;
       if (Math.random() * 100 <= prob) {
         console.log(`[PFA] Auto-advancing from "${this.currentNode}" to "${conn.target}"`);
+        // onNodeChanged fires from _postTransitionCommon at the APPLY point —
+        // reporting here would name the OLD node on the quantized/fade_out paths
+        // (and double-fire on the instant one).
         this._executeTransition(conn);
-        // Fire onNodeChanged callback (same as navigate())
-        if (this.engine.onNodeChanged && this.currentNode) {
-          const node = this.nodeGraph.nodes[this.currentNode];
-          this.engine.onNodeChanged(this.name, this.currentNode, node?.name);
-        }
         return;
       }
     }
