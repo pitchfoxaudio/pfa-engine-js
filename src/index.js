@@ -545,7 +545,7 @@ function _dopplerRatio(srcVel, lisVel, srcPos, lisPos, amount, c = _DOPPLER_C) {
 
 /**
  * Fade-in curve shape 0→1 for progress ∈ [0,1]. Editor parity:
- * core/track.py::_get_fade_value. For fade-out callers pass f(1-p) inline.
+ * the editor's _get_fade_value. For fade-out callers pass f(1-p) inline.
  */
 function _evalFadeInCurve(progress, curve) {
   const p = Math.max(0, Math.min(1, progress));
@@ -3531,7 +3531,7 @@ class PFAEvent {
 
   // Fabric model: EVERY level of a level_specific track gets its own verdict +
   // reroll grid at start. Background levels keep rolling while inactive (editor
-  // reference: core/region.py _advance_level_state simulates exactly this), so
+  // reference: the editor's _advance_level_state simulates exactly this), so
   // entering a level at any moment catches its live chance texture.
   _initialPlayChanceRoll() {
     this._trackChanceState = {};
@@ -3764,7 +3764,7 @@ class PFAEvent {
    * If the current node has `free_tempo: true`, force instant — no bar/beat
    * grid exists to snap to. Covers level switches, node transitions, and
    * connection-level quantize overrides since they all route through here.
-   * Editor parity: core/music_event.py:404-408 in _compute_scheduled_switch_position.
+   * Editor parity: its _compute_scheduled_switch_position.
    * Godot parity: `_get_quantized_time` (pfa_event.gd:839).
    */
   _getQuantizedTime(quantize) {
@@ -3913,7 +3913,7 @@ class PFAEvent {
     // a muted lane (levelGain 0) and is inaudible. The editor's freeze survives
     // only in its original narrow sense ("OLD level during crossfade must not swap
     // variation at loop boundary — counters still advance but the swap itself is
-    // vetoed", core/multisample.py:475-479): while the OUTGOING lane is still
+    // vetoed", the editor does the same): while the OUTGOING lane is still
     // audibly fading, replacing its source would jump content mid-fade. Checked
     // BEFORE the pick so a vetoed boundary never consumes the rotation bag.
     if (!isShared && level !== this.currentLevel) {
@@ -4140,7 +4140,7 @@ class PFAEvent {
   }
 
   /**
-   * Variant selection. Canonical algorithm — port of core/stinger_picker.py.
+   * Variant selection. Canonical algorithm — port of the editor's picker.
    * Modes: "random" | "weighted" | "no_repeat" (unknown falls back to random).
    * Mutates bundle.state.lastIdx on each pick (used by no_repeat).
    */
@@ -5042,7 +5042,7 @@ class PFATrack {
 
     if (!buffers || buffers.length === 0) return { buffer: null, clip: null };
 
-    // SFX picks a fresh variation per trigger (editor parity: core/sfx_event.py
+    // SFX picks a fresh variation per trigger (editor parity: its SFX
     // trigger() rolls switch_chance, then switch_variation() → pick_random_variation).
     // Music leaves the pool's current to the Conductor (_switchVariation, JIT Stop+Start, doc/08).
     const lvlKey = this._variationKey(level);
@@ -5340,7 +5340,8 @@ class PFAGroup {
  */
 // Anti-click floor (ms) for DIRECT spatial-voice stops — stop(0)/destroy(0)/stopAll(0)/
 // voice-steal on a release_fade:0 event. A LOOP cut mid-wave by a bare source.stop() is a
-// step discontinuity = audible click (web-billiards ball_roll stop repro); one-shots
+// step discontinuity = audible click (observed on a rolling-ball loop stopped
+// mid-roll); one-shots
 // end at a natural zero and never hit this path. 20ms matches the engine's own sub-level
 // stop micro-fade. Event-routed stops (PFA.stop → event gain) have their own anti-click.
 const SPATIAL_STOP_FLOOR_MS = 20;
