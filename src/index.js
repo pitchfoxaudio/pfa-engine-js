@@ -33,6 +33,167 @@
  * emitter.trigger('enemy_idle');
  */
 
+// ── Pack Intake ──────────────────────────────────────────────────────
+
+/**
+ * Structural intake gate — the ONE place a pack is accepted or refused.
+ * Returns '' when the config may become engine state, otherwise the human reason.
+ *
+ * It refuses input that is not a Studio pack at all (wrong shape, foreign or
+ * future schema) and stays deliberately tolerant about AUTHORING: a declared but
+ * empty pack is legal, and unknown extra keys are ignored as always. Without this
+ * gate both loaders resolved `true` for `{}`, `[]` and someone else's JSON, and
+ * the game only found out much later — as missing or silently wrong playback.
+ * Godot parity: PFA._config_refusal.
+ * @param {*} data - parsed JSON
+ * @returns {string}
+ * @private
+ */
+function _configRefusal(data) {
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+    return 'config is not a JSON object';
+  }
+  if (data.version !== undefined) {
+    if (String(data.version).split('.')[0] !== '1') {
+      return `config schema ${data.version} is not supported (this engine implements 1.x)`;
+    }
+  } else if (data.events === undefined) {
+    return 'not a PFA pack (neither "version" nor "events")';
+  }
+  const events = data.events;
+  if (events !== undefined &&
+      (events === null || typeof events !== 'object' || Array.isArray(events))) {
+    return '"events" is not an object';
+  }
+  if (data.groups !== undefined && !Array.isArray(data.groups)) {
+    return '"groups" is not an array';
+  }
+  return '';
+}
+
+/**
+ * Load-bearing numeric intake. A config carrying Infinity/NaN/negative where the
+ * engine multiplies gains or counts voices plays silently wrong instead of
+ * failing, so an out-of-contract value falls back to the documented default.
+ * Godot parity: PFA._sane_amp.
+ * @private
+ */
+function _saneAmp(value, fallback) {
+  return (typeof value === 'number' && Number.isFinite(value) && value >= 0) ? value : fallback;
+}
+
+/**
+ * Parse a .pfabank container — header, section directory, JSON section, audio
+ * entry table. Every structural claim is verified BEFORE anything is returned:
+ * a damaged bank must fail as a clean refusal, never as a plausible slice that
+ * decodes into noise (sections that leave the file or overlap each other are the
+ * class that used to pass intake and hand the decoder JSON bytes as audio).
+ * Godot parity: PFABankLoader.load_bank.
+ * @param {ArrayBuffer} buffer
+ * @returns {{ config: Object, dataOffset: number, entries: Object } | { error: string }}
+ * @private
+ */
+function _parseBank(buffer) {
+  const HEADER_SIZE = 64;
+  const SECTION_ENTRY_SIZE = 32;
+  const size = buffer.byteLength;
+
+  if (size < HEADER_SIZE) return { error: `file too small: ${size} bytes` };
+
+  const view = new DataView(buffer);
+  const magic = new Uint8Array(buffer, 0, 8);
+  const expected = [0x50, 0x46, 0x41, 0x42, 0x41, 0x4E, 0x4B, 0x00]; // "PFABANK\0"
+  for (let i = 0; i < 8; i++) {
+    if (magic[i] !== expected[i]) return { error: 'invalid bank magic bytes' };
+  }
+
+  const verMajor = view.getUint16(8, true);
+  const verMinor = view.getUint16(10, true);
+  if (verMajor !== 1) return { error: `unsupported bank version ${verMajor}.${verMinor}` };
+
+  // The header states its own file size — the cheapest truncation/append detector.
+  const fileSize = Number(view.getBigUint64(52, true));
+  if (fileSize !== size) {
+    return { error: `size mismatch: header says ${fileSize} bytes, file is ${size}` };
+  }
+
+  const sectionDirOff = Number(view.getBigUint64(36, true));
+  const sectionCount = view.getUint32(44, true);
+  const sectionEntrySize = view.getUint32(48, true);
+  const dirEnd = sectionDirOff + sectionCount * sectionEntrySize;
+  if (sectionCount <= 0 || sectionEntrySize < SECTION_ENTRY_SIZE ||
+      sectionDirOff < HEADER_SIZE || dirEnd > size) {
+    return {
+      error: `damaged section directory (offset=${sectionDirOff}, count=${sectionCount}, ` +
+             `entry=${sectionEntrySize}, file=${size})`,
+    };
+  }
+
+  let jsonOffset = 0, jsonLength = 0;
+  let dataOffset = 0, dataLength = 0;
+  const ranges = [];
+
+  for (let i = 0; i < sectionCount; i++) {
+    const entryOff = sectionDirOff + i * sectionEntrySize;
+    const type = String.fromCharCode(...new Uint8Array(buffer, entryOff, 4));
+    const secOffset = Number(view.getBigUint64(entryOff + 8, true));
+    const secLength = Number(view.getBigUint64(entryOff + 16, true));
+
+    // Every section body lives after the directory and inside the file.
+    if (secOffset < dirEnd || secLength < 0 || secOffset + secLength > size) {
+      return { error: `section ${type} out of bounds (offset=${secOffset}, length=${secLength}, file=${size})` };
+    }
+    for (const other of ranges) {
+      if (secOffset < other.offset + other.length && other.offset < secOffset + secLength) {
+        return { error: `sections ${type} and ${other.type} overlap` };
+      }
+    }
+    ranges.push({ type, offset: secOffset, length: secLength });
+
+    if (type === 'JSON') {
+      jsonOffset = secOffset;
+      jsonLength = secLength;
+    } else if (type === 'DATA') {
+      dataOffset = secOffset;
+      dataLength = secLength;
+    }
+  }
+
+  if (!jsonLength) return { error: 'bank has no JSON section' };
+
+  let config;
+  try {
+    config = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, jsonOffset, jsonLength)));
+  } catch (e) {
+    return { error: `bank JSON is not parseable (${e.message})` };
+  }
+  if (config === null || typeof config !== 'object' || Array.isArray(config)) {
+    return { error: 'bank JSON is not an object' };
+  }
+
+  const entries = config._audio_entries || {};
+  if (entries === null || typeof entries !== 'object' || Array.isArray(entries)) {
+    return { error: '_audio_entries is not an object' };
+  }
+
+  // Every audio entry must resolve inside DATA — checked once here instead of per
+  // slice, so a damaged directory can never reach a decoder.
+  for (const relPath of Object.keys(entries)) {
+    const entry = entries[relPath];
+    if (entry === null || typeof entry !== 'object') {
+      return { error: `audio entry ${relPath} is not an object` };
+    }
+    const off = entry.offset, len = entry.length;
+    if (!Number.isInteger(off) || !Number.isInteger(len) || off < 0 || len < 0 ||
+        off + len > dataLength || dataOffset + off + len > size) {
+      return { error: `audio entry out of bounds: ${relPath} (offset=${off}, length=${len}, data=${dataLength})` };
+    }
+  }
+
+  delete config._audio_entries;
+  return { config, dataOffset, entries };
+}
+
 // ── Spatial Audio Utilities ──────────────────────────────────────────
 
 const _SPATIAL_DEFAULTS = {
@@ -142,7 +303,7 @@ function _intensityToGainPitch(intensity, cfg) {
 // ── Reverb (algorithmic Freeverb send-bus) ───────────────────────────
 //
 // Web parity for the Godot reverb (pfa_reverb.gd), but HONEST where Godot's
-// native AudioEffectReverb is quirky (sess8 audit). The neutral zone descriptor
+// native AudioEffectReverb is quirky (measured). The neutral zone descriptor
 // (config.json `reverb_zones.zones[name]`, snake_case, flat) is shared byte-for-
 // byte with Godot; the WEB engine deliberately diverges on three keys:
 //   • decay        — REAL RT60 in seconds. Godot ignores it (Freeverb has no
@@ -912,59 +1073,39 @@ class PFA {
   /**
    * Load audio pack from config.json.
    * @param {string} configUrl - URL to config.json
-   * @returns {Promise<boolean>}
+   * @returns {Promise<boolean>} - true when the pack is live. NEVER rejects: a
+   *   missing, damaged or foreign pack resolves `false` and leaves the pack that
+   *   is already loaded untouched (a live game must not go silent because a
+   *   reload pointed at the wrong file).
    */
   async loadPack(configUrl) {
     if (!this.ctx) this.init();
 
+    let config;
     try {
       const response = await fetch(configUrl, this._freshFetch ? { cache: 'reload' } : undefined);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      this.config = await response.json();
+      config = await response.json();
     } catch (e) {
       console.error(`[PFA] Failed to load config: ${configUrl}`, e);
       return false;
     }
 
-    this.basePath = configUrl.substring(0, configUrl.lastIndexOf('/'));
-
-    // Authored master volume (exporter writes the key only when ≠ 1.0; absent ⇒
-    // unity). Config is the source of truth — a live-reload restores the authored
-    // master on BOTH engines (Godot re-reads it the same way, pfa.gd load_pack).
-    this.setMasterVolume(this.config.master_volume !== undefined ? this.config.master_volume : 1.0);
-
-    // Parse groups
-    this.groups = {};
-    for (const groupData of (this.config.groups || [])) {
-      this.groups[groupData.name] = new PFAGroup(groupData);
+    const refusal = _configRefusal(config);
+    if (refusal) {
+      console.error(`[PFA] Refused pack ${configUrl}: ${refusal}`);
+      return false;
     }
 
-    // Parse events
-    this.events = {};
-    const eventsData = this.config.events || {};
-    for (const eventName of Object.keys(eventsData)) {
-      const eventData = eventsData[eventName];
-      const event = new PFAEvent(eventName, eventData, this);
-      this.events[eventName] = event;
-
-      // Link group volume
-      for (const groupName of Object.keys(this.groups)) {
-        if (this.groups[groupName].eventNames.includes(eventName)) {
-          event.groupGain = this.groups[groupName].volume;
-          break;
-        }
-      }
+    try {
+      await this._applyConfig(config, {
+        basePath: configUrl.substring(0, configUrl.lastIndexOf('/')),
+      });
+    } catch (e) {
+      console.error(`[PFA] Failed to parse pack: ${configUrl}`, e);
+      return false;
     }
 
-    // Reverb (opt-in): register the sample-accurate Freeverb worklet (Blob URL) first,
-    // then build the send-bus from config.reverb_zones. The worklet is the default core;
-    // if registration fails the bus falls back to native nodes (still functional).
-    if (this.config && this.config.reverb_zones && this.config.reverb_zones.zones) {
-      await this._ensureReverbWorkletModule();
-    }
-    this._loadReverbZones();
-
-    this.loaded = true;
     console.log(`[PFA] Loaded: ${Object.keys(this.events).length} events, ${Object.keys(this.groups).length} groups`);
     return true;
   }
@@ -973,7 +1114,8 @@ class PFA {
    * Load audio pack from a .pfabank binary bank file.
    * Single fetch replaces config.json + N audio file fetches.
    * @param {string} bankUrl - URL to .pfabank file
-   * @returns {Promise<boolean>}
+   * @returns {Promise<boolean>} - same contract as loadPack: never rejects, and a
+   *   damaged container is a `false`, not a thrown RangeError.
    */
   async loadBank(bankUrl) {
     if (!this.ctx) this.init();
@@ -988,99 +1130,34 @@ class PFA {
       return false;
     }
 
-    const view = new DataView(buffer);
-
-    // Validate magic "PFABANK\0"
-    const magic = new Uint8Array(buffer, 0, 8);
-    const expected = [0x50, 0x46, 0x41, 0x42, 0x41, 0x4E, 0x4B, 0x00]; // "PFABANK\0"
-    for (let i = 0; i < 8; i++) {
-      if (magic[i] !== expected[i]) {
-        console.error('[PFA] Invalid bank magic bytes');
-        return false;
-      }
+    let bank;
+    try {
+      bank = _parseBank(buffer);
+    } catch (e) {
+      console.error(`[PFA] Failed to parse bank: ${bankUrl}`, e);
+      return false;
     }
-
-    // Read header
-    const verMajor = view.getUint16(8, true);
-    if (verMajor !== 1) {
-      console.error(`[PFA] Unsupported bank version: ${verMajor}`);
+    if (bank.error) {
+      console.error(`[PFA] Refused bank ${bankUrl}: ${bank.error}`);
       return false;
     }
 
-    const sectionDirOff = Number(view.getBigUint64(36, true));
-    const sectionCount = view.getUint32(44, true);
-    const sectionEntrySize = view.getUint32(48, true);
-
-    // Parse section directory
-    let jsonOffset = 0, jsonLength = 0;
-    let dataOffset = 0;
-
-    for (let i = 0; i < sectionCount; i++) {
-      const entryOff = sectionDirOff + i * sectionEntrySize;
-      const typeBytes = new Uint8Array(buffer, entryOff, 4);
-      const type = String.fromCharCode(...typeBytes);
-      const secOffset = Number(view.getBigUint64(entryOff + 8, true));
-      const secLength = Number(view.getBigUint64(entryOff + 16, true));
-
-      if (type === 'JSON') {
-        jsonOffset = secOffset;
-        jsonLength = secLength;
-      } else if (type === 'DATA') {
-        dataOffset = secOffset;
-      }
-    }
-
-    if (!jsonOffset) {
-      console.error('[PFA] Bank has no JSON section');
+    // Same gate as the loose path — a container that parsed fine can still carry
+    // a foreign or empty config.
+    const refusal = _configRefusal(bank.config);
+    if (refusal) {
+      console.error(`[PFA] Refused bank ${bankUrl}: ${refusal}`);
       return false;
     }
 
-    // Extract and parse JSON config
-    const jsonBytes = new Uint8Array(buffer, jsonOffset, jsonLength);
-    const jsonStr = new TextDecoder().decode(jsonBytes);
-    this.config = JSON.parse(jsonStr);
-
-    // Store bank data for on-demand slicing
-    this._bankBuffer = buffer;
-    this._bankDataOffset = dataOffset;
-    this._bankEntries = this.config._audio_entries || {};
-    this._bankMode = true;
-    delete this.config._audio_entries;
-
-    // Authored master volume (same intake as loadPack; absent ⇒ unity).
-    this.setMasterVolume(this.config.master_volume !== undefined ? this.config.master_volume : 1.0);
-
-    // Parse groups (same as loadPack)
-    this.groups = {};
-    for (const groupData of (this.config.groups || [])) {
-      this.groups[groupData.name] = new PFAGroup(groupData);
+    try {
+      await this._applyConfig(bank.config, {
+        bank: { buffer, dataOffset: bank.dataOffset, entries: bank.entries },
+      });
+    } catch (e) {
+      console.error(`[PFA] Failed to parse bank: ${bankUrl}`, e);
+      return false;
     }
-
-    // Parse events (same as loadPack)
-    this.events = {};
-    const eventsData = this.config.events || {};
-    for (const eventName of Object.keys(eventsData)) {
-      const eventData = eventsData[eventName];
-      const event = new PFAEvent(eventName, eventData, this);
-      this.events[eventName] = event;
-
-      for (const groupName of Object.keys(this.groups)) {
-        if (this.groups[groupName].eventNames.includes(eventName)) {
-          event.groupGain = this.groups[groupName].volume;
-          break;
-        }
-      }
-    }
-
-    // Reverb (opt-in): register the sample-accurate Freeverb worklet (Blob URL) first,
-    // then build the send-bus from config.reverb_zones. The worklet is the default core;
-    // if registration fails the bus falls back to native nodes (still functional).
-    if (this.config && this.config.reverb_zones && this.config.reverb_zones.zones) {
-      await this._ensureReverbWorkletModule();
-    }
-    this._loadReverbZones();
-
-    this.loaded = true;
 
     // Budget is documented as auto-detected by default: bank entries carry byte
     // lengths, so engage management now, not only after preloadAll() — a lazy
@@ -1090,6 +1167,97 @@ class PFA {
     const bankSizeMB = (buffer.byteLength / (1024 * 1024)).toFixed(1);
     console.log(`[PFA] Bank loaded: ${bankSizeMB} MB, ${Object.keys(this.events).length} events, ${Object.keys(this._bankEntries).length} audio files`);
     return true;
+  }
+
+  /**
+   * @private Build the new generation, then swap it in — the commit point both
+   * loaders share. Nothing here touches engine state until every event has
+   * parsed, so a config that blows up mid-parse leaves the previous pack playing
+   * instead of a half-installed one.
+   * @param {Object} config - already past _configRefusal
+   * @param {Object} source - { basePath } for a loose pack, or
+   *   { bank: { buffer, dataOffset, entries } } for a bank
+   */
+  async _applyConfig(config, source) {
+    // ── build (engine state untouched) ──
+    const groups = {};
+    for (const groupData of (config.groups || [])) {
+      groups[groupData.name] = new PFAGroup(groupData);
+    }
+
+    const events = {};
+    const eventsData = config.events || {};
+    for (const eventName of Object.keys(eventsData)) {
+      const event = new PFAEvent(eventName, eventsData[eventName], this);
+      events[eventName] = event;
+
+      // Link group volume
+      for (const groupName of Object.keys(groups)) {
+        if (groups[groupName].eventNames.includes(eventName)) {
+          event.groupGain = groups[groupName].volume;
+          break;
+        }
+      }
+    }
+
+    // ── commit ──
+    // The outgoing generation goes silent FIRST. Replacing this.events orphans
+    // every voice the old pack had playing: they keep their own buffer refs and
+    // run to the end of a loop that never ends, while stop()/stopAll() look up
+    // the NEW map and find nothing to stop — a music bed from the previous pack
+    // playing under the current one, with no API left to reach it. Live Connect
+    // already did this by hand before its reload (PFALiveConnect 'reload' calls
+    // stopAll first, and stopAll's own comment calls the survivors "the OLD pack
+    // as a zombie ambience"); the door a game uses for a scene change did not.
+    // Godot frees the previous generation's event nodes at the same point
+    // (pfa.gd load_pack), so this is also what keeps the two engines in step.
+    this.stopAll(0);
+    this.config = config;
+    // Source mode belongs to the pack being installed, never to the one before
+    // it: a loose pack loaded after a bank used to keep _bankMode true and serve
+    // the bank's bytes forever — which is exactly the documented Live Connect
+    // "release the bank, sync loose files" recipe.
+    this._bankMode = !!source.bank;
+    this._bankBuffer = source.bank ? source.bank.buffer : null;
+    this._bankDataOffset = source.bank ? source.bank.dataOffset : 0;
+    this._bankEntries = source.bank ? source.bank.entries : null;
+    this.basePath = source.basePath !== undefined ? source.basePath : '';
+    // Both caches are keyed by file PATH and a new pack reuses paths by design
+    // (Sync rewrites exported files under the same names) — keeping them across a
+    // load is what let a successful reload keep playing yesterday's audio.
+    // Voices already playing are unaffected: they hold their own buffer refs.
+    this._assetStore = {};
+    this._decodeCache = {};
+    this._decodeLRU = [];
+    this._decodedBytes = 0;
+    this.groups = groups;
+    this.events = events;
+
+    // Authored master volume (exporter writes the key only when ≠ 1.0; absent ⇒
+    // unity). Config is the source of truth — a live-reload restores the authored
+    // master on BOTH engines (Godot re-reads it the same way, pfa.gd load_pack).
+    this.setMasterVolume(_saneAmp(config.master_volume, 1.0));
+
+    // The pack IS installed at this point — everything below is optional
+    // decoration on top of it. Marking it loaded here, and not after, is what
+    // keeps the loaders' answer true: a throw further down used to reach the
+    // caller's catch as `return false` on a pack that had already replaced its
+    // predecessor, so "refused — keep the loaded pack" was advice about a pack
+    // that was already gone.
+    this.loaded = true;
+
+    // Reverb (opt-in): register the sample-accurate Freeverb worklet (Blob URL) first,
+    // then build the send-bus from config.reverb_zones. The worklet is the default core;
+    // if registration fails the bus falls back to native nodes (still functional).
+    // A bus that cannot be built at all costs the pack its reverb, not its load.
+    try {
+      if (config.reverb_zones && config.reverb_zones.zones) {
+        await this._ensureReverbWorkletModule();
+      }
+      this._loadReverbZones();
+    } catch (e) {
+      console.error('[PFA] Reverb bus unavailable — the pack is loaded and plays dry', e);
+    }
   }
 
   /**
@@ -1138,12 +1306,12 @@ class PFA {
 
   /**
    * Flush the in-memory audio caches so the next decode re-fetches and
-   * re-decodes. Live Connect calls this on reload: Sync rewrites exported
-   * files UNDER THE SAME NAMES, and both caches key by file path — without
-   * a flush a re-load keeps playing yesterday's audio forever.
+   * re-decodes. Loading a pack already installs a clean generation (see
+   * _applyConfig), so this is for a game that wants to drop cached audio
+   * WITHOUT reloading — e.g. reclaiming memory between scenes.
    * Bank mode keeps the compressed store: the bank bytes ARE the pack
-   * (Sync never rewrites a bank) and _bankBuffer may already be released,
-   * so dropping the store would strand every future re-decode.
+   * (nothing rewrites a bank under the engine) and _bankBuffer may already be
+   * released, so dropping the store would strand every future re-decode.
    * Playing voices are unaffected — they hold their own buffer references.
    */
   clearAudioCaches() {
@@ -1989,7 +2157,7 @@ class PFA {
     // dict (config.intensity); the authored event.intensity curve maps it to a
     // per-voice gain + pitch offset. Constant for a loop's lifetime → resolved
     // once, BEFORE the cap gate — the candidate's audibility score needs it
-    // (voice stealing, sess122).
+    // (voice stealing).
     const iv = _intensityToGainPitch(config && config.intensity, event.intensity);
     const is3D = cfg.mode === '3D' && z != null;
     const pos = { x, y, z: z || 0 };
@@ -2027,14 +2195,19 @@ class PFA {
       }
     }
 
-    if (this.onSfxTriggered) this.onSfxTriggered(eventName);
+    // One signature at every call site: the flat path reports played[] and the
+    // spatial path reports an empty array (per-voice reporting is a follow-up) —
+    // never a missing argument, which turned a shared `(name, played) =>
+    // played.length` handler into a TypeError on the first spatial hit.
+    // Godot parity: sfx_triggered.emit(event_name, []).
+    if (this.onSfxTriggered) this.onSfxTriggered(eventName, []);
     return voices.length > 0 ? voices[0] : null;
   }
 
   /**
    * @private Distance-attenuation factor at a world position from the current
    * listener — the audibility-score shading for steal candidates and live
-   * voices alike (voice stealing, sess122). Uses the SAME curve the web path
+   * voices alike (voice stealing). Uses the SAME curve the web path
    * plays (_computeDistanceAttenuation), so ranking is exactly what the mix
    * does. No attenuation cfg ⇒ 1.0 (rank on gain alone).
    */
@@ -2139,7 +2312,7 @@ class PFA {
     // factor; a releasing voice (isActive false) frees its cap slot at once and
     // is never re-stolen. release() = the anti-click seam (stop(0) floors to
     // SPATIAL_STOP_FLOOR_MS) — NEVER the authored release_fade: a steal is not
-    // an authored stop (sess125 defect B: authored tails kept slot-free voices
+    // an authored stop (authored tails kept slot-free voices
     // audible ~574 ms past eviction, "audible ≤ cap" broke, and a smaller cap
     // rang LOUDER than a bigger one). The authored fade stays on the no-arg
     // stop() — game-driven stop()/destroy() paths.
@@ -2348,10 +2521,12 @@ class PFAEvent {
     this.name = name;
     this.engine = engine;
     this.type = data.type || 'music';
-    // ?? not ||: volume 0.0 (fader at bottom) and fade_duration 0.0 (instant
-    // level switch) are authorable in the editor and must survive the parse —
-    // Godot's Dictionary.get(key, default) keeps explicit zeros the same way.
-    this.volume = data.volume ?? 1.0;
+    // _saneAmp, not ?? : volume 0.0 (fader at bottom) and fade_duration 0.0
+    // (instant level switch) are authorable in the editor and must survive the
+    // parse — Godot's Dictionary.get(key, default) keeps explicit zeros the same
+    // way — while a negative or non-finite gain (which would phase-invert or NaN
+    // the whole chain) falls back to unity.
+    this.volume = _saneAmp(data.volume, 1.0);
     this.groupGain = 1.0;
     this.bpm = data.bpm || 120;
     this.timeSignature = data.time_signature || [4, 4];
@@ -2392,8 +2567,11 @@ class PFAEvent {
     // variation. null/absent/disabled ⇒ no scaling (a bare trigger = full
     // strength). Read via _intensityToGainPitch in trigger / triggerSfxSpatial.
     this.intensity = data.intensity || null;
-    this.cooldownMs = data.cooldown_ms || 0;
-    this.maxInstances = data.max_instances || 8;
+    this.cooldownMs = _saneAmp(data.cooldown_ms, 0);
+    // 0 stays 0 — the documented "uncapped" (Godot: cap <= 0 ⇒ uncapped); only a
+    // negative/non-finite count, which would silently uncap an authored ceiling,
+    // falls back to the default.
+    this.maxInstances = Math.floor(_saneAmp(data.max_instances, 8));
     this.levels = data.levels || [];
     this.currentLevel = 0;
     this.isPlaying = false;
@@ -2716,8 +2894,8 @@ class PFAEvent {
   }
 
   /**
-   * Cooldown + max_instances gate — voice stealing by AUDIBILITY (sess122;
-   * canon = godot pfa_event._check_can_trigger + tests/test-voice-stealing.js).
+   * Cooldown + max_instances gate — voice stealing by AUDIBILITY
+   * (canon = godot pfa_event._check_can_trigger).
    *
    * ONE pool per event (_activeVoices holds flat AND spatial voice wrappers).
    * Score = pre_amp (track × clip × rand × intensity) × distance factor
@@ -2781,7 +2959,7 @@ class PFAEvent {
     // Computed ONCE here (the event owns the curve config); every track voice for
     // this trigger gets the same offset. Neutral {1, 0} when disabled/absent.
     // Resolved BEFORE the cap gate — the candidate's audibility score needs it
-    // (voice stealing, sess122).
+    // (voice stealing).
     const iv = _intensityToGainPitch(intensity, this.intensity);
 
     if (!this._checkCanTrigger(iv.gainMult * this._maxTrackVolume(), 1.0, this.tracks.length)) return [];
@@ -4417,7 +4595,7 @@ class PFATrack {
         try {
           const t0 = this.engine._now();
           voiceGain.gain.cancelScheduledValues(t0);
-          // sess125 defect A: clamp the ramp start to the spawn target — a
+          // Clamp the ramp start to the spawn target — a
           // voice younger than ~5 ms still reports the GainNode default 1.0
           // (its scheduled envelope hasn't landed), and the envelope never
           // exceeds `target`.
@@ -4732,7 +4910,7 @@ class PFATrack {
 
       // Splice the new fade onto the gain's LIVE value, anchored at the current
       // time. Two rules, both load-bearing (validated against real Web Audio via
-      // OfflineAudioContext, see js/tests/test-event-fade-overlap.js §6):
+      // OfflineAudioContext):
       //   1. v0 = g.value — the TRUE in-flight amplitude. A linear estimate of an
       //      equal_power curve can be off by ~0.2, which a hard setValueAtTime then
       //      turns into an audible step.
@@ -5149,7 +5327,7 @@ class PFATrack {
 class PFAGroup {
   constructor(data) {
     this.name = data.name || '';
-    this.volume = data.volume ?? 1.0;  // ?? — a group fader at 0.0 means silence
+    this.volume = _saneAmp(data.volume, 1.0);  // a group fader at 0.0 means silence — kept
     this.eventNames = data.events || [];
   }
 }
@@ -5162,7 +5340,7 @@ class PFAGroup {
  */
 // Anti-click floor (ms) for DIRECT spatial-voice stops — stop(0)/destroy(0)/stopAll(0)/
 // voice-steal on a release_fade:0 event. A LOOP cut mid-wave by a bare source.stop() is a
-// step discontinuity = audible click (web-billiards ball_roll stop repro, sess28); one-shots
+// step discontinuity = audible click (web-billiards ball_roll stop repro); one-shots
 // end at a natural zero and never hit this path. 20ms matches the engine's own sub-level
 // stop micro-fade. Event-routed stops (PFA.stop → event gain) have their own anti-click.
 const SPATIAL_STOP_FLOOR_MS = 20;
@@ -5222,7 +5400,7 @@ class PFASpatialVoice {
       if (ms > 0 && this._voiceGain) {
         const ctx = this._voiceGain.context;
         const now = ctx.currentTime + 0.005;
-        // sess125 defect A: never trust a raw gain.value read for the ramp
+        // Never trust a raw gain.value read for the ramp
         // start. A voice younger than ~5 ms still reports the GainNode DEFAULT
         // (1.0) — its scheduled quiet target hasn't landed — and the cancel
         // below wipes that pending target, so the victim would release from
@@ -5454,18 +5632,22 @@ class PFALiveConnect {
         this._log('[PFA Live] Reloading audio pack...');
         if (this.pfa.config) {
           const configUrl = this.pfa.basePath + '/config.json';
-          // Sync rewrites exported files under the SAME names — flush the
-          // byte/decode caches and revalidate the browser HTTP cache from
-          // here on, or the re-load keeps serving the pre-sync audio.
-          if (this.pfa.clearAudioCaches) this.pfa.clearAudioCaches();
+          // Sync rewrites exported files under the SAME names, so the reload must
+          // revalidate the browser HTTP cache from here on. The engine's own
+          // byte/decode caches are flushed by the load itself (loadPack commits a
+          // clean generation) — clearing them here would also throw them away when
+          // the reload is REFUSED, which is exactly when the old pack must survive.
           this.pfa._freshFetch = true;
           this.pfa.stopAll(0.5);
           setTimeout(async () => {
             try {
-              this.pfa.events = {};
-              this.pfa.groups = {};
-              this.pfa.loaded = false;
-              await this.pfa.loadPack(configUrl);
+              // No pre-clearing of events/groups: loadPack installs a whole new
+              // generation atomically, and a refused reload (Studio mid-write,
+              // wrong path) must leave the running pack playable.
+              if (!await this.pfa.loadPack(configUrl)) {
+                this._log('[PFA Live] Reload refused — keeping the loaded pack');
+                return;
+              }
               if (this.pfa.preloadAll) {
                 await this.pfa.preloadAll();
               }
@@ -5540,7 +5722,7 @@ class PFALiveConnect {
 }
 
 /** Engine version (also sent in the Live Connect hello). */
-PFA.VERSION = '1.15.0';
+PFA.VERSION = '1.16.0';
 
 // Browser global
 if (typeof window !== 'undefined') {

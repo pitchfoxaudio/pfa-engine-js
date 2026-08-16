@@ -4,7 +4,7 @@
 
 It plays audio projects authored in **PFA Studio** (the desktop editor): Studio exports a `config.json` + audio files (or a single `.pfabank`), the engine loads and performs them — adaptive music levels, node-graph transitions, randomized SFX, spatial voices, reverb zones. The same export drives the [PFA Engine for Godot](https://github.com/pitchfoxaudio/pfa-engine-godot); design once, ship on both.
 
-- Engine version **1.15.x** · config schema **v1.1** · zero dependencies · MIT
+- Engine version **1.16.x** · config schema **v1.1** · zero dependencies · MIT
 - Part of the **PFA suite** — all components: [github.com/pitchfoxaudio](https://github.com/pitchfoxaudio)
 - Authoring is documented in the **PFA Studio manual** (the editor ships it); this README covers the runtime API.
 
@@ -20,11 +20,11 @@ npm install pfa-engine
 import { PFA, PFALiveConnect } from 'pfa-engine';
 ```
 
-Or without a bundler — the engine is a single file, `src/index.js`, with no dependencies:
+Or without a bundler — the engine is a single file, `src/index.js`, with no dependencies. Copy that one file next to your page (rename it if you like) and import it by the name you gave it:
 
 ```html
 <script type="module">
-  import { PFA } from './pfa-engine.js';
+  import { PFA } from './src/index.js';
   const pfa = new PFA();
 </script>
 ```
@@ -64,13 +64,15 @@ function onBallHit(x, y, speed) {
 }
 ```
 
-Event names come from your Studio project (lowercase, `_` for spaces); `pfa.getEventNames()` lists everything the pack loaded.
+Event names come from your Studio project, exported as file-safe **keys**: lowercased, spaces → `_`, characters a file name can't carry (`: / \ * ? " < > |`) → `_`, trailing dots dropped, Windows reserved stems (`CON`, `NUL`, …) suffixed with `_`, 64 characters max — so an event named `Boss: Phase/One` is called as `boss__phase_one`. Lookup is exact; the engine does not normalize at call time. Every pack's README lists the key for each event, and `pfa.getEventNames()` returns exactly what the pack loaded.
 
 ---
 
 ## Loading & Memory
 
-`loadPack()` / `loadBank()` parse events and groups but decode **no audio** (lazy). An event's samples are decoded on first use — so without preloading, the very first trigger of each event pays a decode cost. Pick a strategy:
+`loadPack()` / `loadBank()` resolve **`true` or `false` and never reject** — a missing file, a damaged bank or JSON that isn't a Studio pack is a `false` with one console error, so `if (!await pfa.loadPack(url))` is the whole error path. A refused load is atomic: whatever was loaded before keeps playing. A load that succeeds installs a whole new generation — the previous pack's voices are stopped and its caches dropped, so nothing of it survives into the new one (load a second pack on a scene change and the first one's music does not play on underneath it).
+
+Both parse events and groups but decode **no audio** (lazy). An event's samples are decoded on first use — so without preloading, the very first trigger of each event pays a decode cost. Pick a strategy:
 
 ### Small game / demo / pack: `preloadAll()`
 
@@ -136,8 +138,8 @@ Browsers expand compressed audio ~20× when decoding (1 MB OGG → ~60 MB PCM), 
 | Method | Description |
 |--------|-------------|
 | `pfa.init()` | Create the AudioContext (call inside a user gesture) |
-| `pfa.loadPack(url)` | Load `config.json` + set up events (no audio decoded yet) |
-| `pfa.loadBank(url)` | Load a `.pfabank` binary bank (single fetch), same API after load |
+| `pfa.loadPack(url)` | Load `config.json` + set up events (no audio decoded yet) — resolves `true`/`false` |
+| `pfa.loadBank(url)` | Load a `.pfabank` binary bank (single fetch), same API after load — resolves `true`/`false` |
 | `pfa.releaseBankBuffer()` | Free the raw bank ArrayBuffer after preloading |
 | `pfa.preload(event)` | Decode one event's audio |
 | `pfa.preloadGroup(group)` | Decode all events in a group |
@@ -172,7 +174,7 @@ Node graph activates when the config has `use_nodes: true`. The engine enters th
 
 | Method | Description |
 |--------|-------------|
-| `pfa.trigger(event, options?)` | Trigger a one-shot SFX. `options.intensity` (0..1) = per-trigger hit strength (see Intensity). Returns `played[]` — one entry per track that fired: `{ track, behavior, variation, variationCount, algo, sample }` |
+| `pfa.trigger(event, options?)` | Trigger a one-shot SFX. `options.intensity` (0..1) = per-trigger hit strength (see Intensity). **async** — fire and forget, or `await` it for `played[]`: one entry per track that fired, `{ track, behavior, variation, variationCount, algo, sample }` |
 
 Cooldown (`cooldown_ms`) and voice cap (`max_instances`, oldest voice stolen) are authored per event in Studio and enforced by the engine. `always_play` layers fire on every level; each fired layer picks a fresh sample variation (switch_chance-gated) with clip trim + fades applied.
 
@@ -196,7 +198,8 @@ Volume chain: `clip × track × event × group × master` — all linear, each s
 pfa.onEventStarted    = (name) => {};
 pfa.onEventStopped    = (name) => {};
 pfa.onLevelChanged    = (name, level) => {};
-pfa.onSfxTriggered    = (name, played) => {};          // played[] as returned by trigger()
+pfa.onSfxTriggered    = (name, played) => {};          // played[] as awaited from trigger();
+                                                       // spatial triggers report an empty array
 pfa.onNodeChanged     = (name, nodeId, nodeName) => {};
 pfa.onSubLevelToggled = (name, subName, enabled) => {};
 pfa.onTransitionInfo  = (name, info) => {};            // see Transition Info below
@@ -235,7 +238,12 @@ pfa.triggerSpatial('explosion', x, y, z);        // 3D (z present ⇒ 3D path)
 pfa.triggerSpatial('ball_hit', x, y, { intensity: 0.8 });   // with per-trigger override
 ```
 
-Returns the first spawned `PFASpatialVoice` (or `null`). Multi-track events spawn one voice per track.
+**async**, like `trigger()`: fire and forget as above, or `await` it to hold the voice — it resolves the first spawned `PFASpatialVoice` (or `null`), and multi-track events spawn one voice per track.
+
+```javascript
+const voice = await pfa.triggerSpatial('siren', x, y);   // keep it to move or stop it
+voice?.stop();
+```
 
 ### Emitters — voices that follow a game object
 
@@ -302,7 +310,7 @@ pfa.triggerSpatial('ball_hit', x, y, { intensity: Math.min(1, relSpeed / 5) });
 
 The mapping is **authored in Studio** (the event's `intensity` block: `vol_db` / `pitch_st` ranges + curves) and applied per voice on top of the random variation. Events without an intensity block ignore the value — so the game can always pass it. Identical math in the Godot engine.
 
-Real-world example (the billiards demo, `games/04_billiards/web/`): 5 events — cue strike, ball hit, cushion, pocket, rolling loop — where every trigger passes `clamp01(speed / max_speed)` and one emitter per rolling ball follows it with `setPosition2D` until `destroy()` on stop.
+Real-world example — the billiards demo: 5 events — cue strike, ball hit, cushion, pocket, rolling loop — where every trigger passes `clamp01(speed / max_speed)` and one emitter per rolling ball follows it with `setPosition2D` until `destroy()` on stop.
 
 ---
 
@@ -406,7 +414,7 @@ live.connect();      // auto-reconnects every 5 s until the editor appears
 live.disconnect();
 ```
 
-Handled editor commands: `reload` (stop-all + re-fetch config + re-preload), `set_volume`, `set_level`, `play`, `stop`, `trigger`, `set_group_volume`, `set_master_volume`, `set_mute`, `duck`, `unduck`. On **Sync** in Studio the game reloads the pack and fires `onReload` — destroy and re-create your spatial emitters there (see the billiards demo).
+Handled editor commands: `reload` (stop-all + re-fetch config + re-preload), `set_volume`, `set_level`, `play`, `stop`, `trigger`, `set_group_volume`, `set_master_volume`, `set_mute`, `duck`, `unduck`. On **Sync** in Studio the game reloads the pack and fires `onReload` — destroy and re-create your spatial emitters there (see the billiards demo). A reload that can't be loaded (Studio mid-write, wrong path) is refused: the running pack keeps playing and `onReload` does not fire.
 
 ---
 
@@ -428,7 +436,7 @@ This package versions independently from the rest of the suite (Studio 0.9.x, Go
 
 **This engine is MIT** — free for commercial and personal use, no attribution required.
 
-It plays packs authored in **PFA Studio**, a separate desktop application with its own license. The Studio beta is free for everyone. For commercial projects it stays free while your total annual gross revenue and funding are under USD $200,000; at or above that, beta builds stay free until a release version ships plus a 60-day transition, then commercial use needs a release license. Beta builds are never remotely disabled, and whatever you make with the Studio stays yours in all cases (full terms in the Studio EULA). The pack format is plain JSON — the engine reads a `config.json` or a `.pfabank`, whatever produced it.
+It plays packs authored in **PFA Studio**, a separate desktop application with its own license. The Studio beta is free for everyone. For commercial projects it stays free while your total annual gross revenue and funding are under USD $200,000; at or above that, beta builds stay free until a release version ships plus a 60-day transition, then commercial use needs a release license. Beta builds are never remotely disabled, and whatever you make with the Studio stays yours in all cases (full terms in the Studio EULA). The pack format is open: a plain-JSON `config.json` next to the audio files, or a single `.pfabank` container carrying that same JSON plus the audio — the engine reads either, whatever produced it.
 
 - Website: [pitchfoxaudio.com](https://pitchfoxaudio.com)
 - Support the project: [Buy Me a Coffee](https://buymeacoffee.com/pitchfoxaudio)
