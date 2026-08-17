@@ -1775,6 +1775,24 @@ class PFA {
     } else {
       event.stop();
     }
+
+    // Spatial half of the same stop. The event gain silences this event's
+    // spatial voices, but a smart re-loop CHAIN would keep re-spawning silent
+    // voices behind it and come back AUDIBLE with the event's next trigger
+    // (two chains stacked). Stop the event's controllers and voices explicitly —
+    // emitters survive, they belong to game objects. Godot parity:
+    // pfa.gd stop() → _spatial.stop_event_voices(event).
+    const fadeMs = dur * 1000;
+    this._emitters.forEach(em => {
+      const keep = [];
+      (em._smartLoops || []).forEach(c => {
+        if (c.event === event) { c.stopped = true; if (c.timer) clearTimeout(c.timer); }
+        else keep.push(c);
+      });
+      em._smartLoops = keep;
+    });
+    this._spatialVoices.slice().forEach(v => { if (v._event === event) v.stop(fadeMs); });
+
     this.onEventStopped?.(eventName);
   }
 
@@ -2307,6 +2325,9 @@ class PFA {
     voice._target = target;
     voice._clipLen = clipLen;
     voice._lpf = lpfNode || null;
+    // Owning event — the per-event stop door (PFA.stop(name)) finds this voice
+    // and its re-loop chain through it (Godot parity: voice meta "event").
+    voice._event = event;
     this._spatialVoices.push(voice);
     // Unified-pool wrapper (voice stealing): score = pre-amp × live distance
     // factor; a releasing voice (isActive false) frees its cap slot at once and
@@ -2370,7 +2391,9 @@ class PFA {
    */
   _startSmartLoop(event, track, cfg, is3D, releaseMs, emitter, level, iv = null) {
     const CROSS = 0.08;
-    const ctrl = { stopped: false, timer: null, active: null, lastClipLen: 1.0, first: true };
+    // `event` lets the per-event stop door kill just THIS event's controllers
+    // (Godot parity: ctrl carries "event" for stop_event_voices).
+    const ctrl = { stopped: false, timer: null, active: null, lastClipLen: 1.0, first: true, event };
     const tick = () => {
       ctrl.timer = null;
       if (ctrl.stopped || (emitter && emitter._destroyed)) return;
@@ -5723,7 +5746,7 @@ class PFALiveConnect {
 }
 
 /** Engine version (also sent in the Live Connect hello). */
-PFA.VERSION = '1.16.0';
+PFA.VERSION = '1.16.1';
 
 // Browser global
 if (typeof window !== 'undefined') {
