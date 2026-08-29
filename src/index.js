@@ -49,13 +49,31 @@
  * @returns {string}
  * @private
  */
+// Highest config-schema minor this engine implements (the compatibility
+// contract is schema v1.1). _configRefusal refuses a newer minor BEFORE any
+// state commit — that is what keeps "whatever was loaded before keeps playing"
+// true for a config from a future Studio. Godot parity: PFA._SCHEMA_MINOR_MAX.
+const SCHEMA_MINOR_MAX = 1;
+
 function _configRefusal(data) {
   if (data === null || typeof data !== 'object' || Array.isArray(data)) {
     return 'config is not a JSON object';
   }
   if (data.version !== undefined) {
-    if (String(data.version).split('.')[0] !== '1') {
+    const parts = String(data.version).split('.');
+    if (parts[0] !== '1') {
       return `config schema ${data.version} is not supported (this engine implements 1.x)`;
+    }
+    // The major alone let a future 1.x minor through, and loadPack
+    // then committed it over the working pack — while the docstring above
+    // promised "future schema" refusal. Godot parity: PFA._config_refusal.
+    if (parts.length > 1) {
+      if (!/^-?\d+$/.test(parts[1])) {
+        return `config schema ${data.version} is not supported (this engine implements 1.x)`;
+      }
+      if (parseInt(parts[1], 10) > SCHEMA_MINOR_MAX) {
+        return `config schema ${data.version} is newer than this engine (supports up to 1.${SCHEMA_MINOR_MAX}) — update the engine`;
+      }
     }
   } else if (data.events === undefined) {
     return 'not a PFA pack (neither "version" nor "events")';
@@ -574,6 +592,16 @@ function _evalFadeInCurve(progress, curve) {
  * Caller is expected to have already called cancelScheduledValues at t0 +
  * epsilon so no prior event conflicts with this ramp.
  */
+// Event-gain anti-click floor (seconds) — the event layer's twin of the voice
+// floors (SPATIAL_STOP_FLOOR_MS, the 20 ms SFX stop). `0` takes the floor too
+// on purpose: the public contract is "0 means as fast as click-free allows,
+// never a hard cut", and an instant gain step on a live waveform is that hard
+// cut — crossfadeTo(ev, 0) shipped one. Genuinely instant sets (fresh-start
+// gain init) call setValueAtTime directly and never ride the tween path.
+// Godot parity: _MICRO_FADE_SEC (30 ms there — frame-based timing needs the
+// wider window; Web Audio schedules sample-accurately).
+const EVENT_FADE_FLOOR_SEC = 0.02;
+
 function _applyFadeCurve(gainParam, v0, v1, t0, duration, curve) {
   if (duration <= 0) {
     gainParam.setValueAtTime(v1, t0);
@@ -1848,7 +1876,10 @@ class PFA {
     // full-strength (1.0). Disabled event ⇒ ignored.
     const intensity = (options && options.intensity != null) ? options.intensity : undefined;
     const played = event.trigger(intensity);
-    this.onSfxTriggered?.(eventName, played);
+    // Outcome callback: onSfxTriggered means an SFX fired. A
+    // refused trigger — cooldown, cap, every chance roll failed — is not an
+    // outcome: the caller sees the [] and listeners hear nothing.
+    if (played.length > 0) this.onSfxTriggered?.(eventName, played);
     return played;
   }
 
@@ -1894,8 +1925,12 @@ class PFA {
   toggleSubLevel(eventName, subLevelName, enabled, fadeDuration = 0.5) {
     const event = this._getEvent(eventName);
     if (!event) return;
-    event.toggleSubLevel(subLevelName, enabled, fadeDuration);
-    this.onSubLevelToggled?.(eventName, subLevelName, enabled);
+    // Outcome callback: the delegate answers whether the toggle
+    // was actually applied — a stopped event or an unknown sub-level is a no-op
+    // and must not be announced as "toggled".
+    if (event.toggleSubLevel(subLevelName, enabled, fadeDuration)) {
+      this.onSubLevelToggled?.(eventName, subLevelName, enabled);
+    }
   }
 
   /**
@@ -2217,8 +2252,9 @@ class PFA {
     // spatial path reports an empty array (per-voice reporting is a follow-up) —
     // never a missing argument, which turned a shared `(name, played) =>
     // played.length` handler into a TypeError on the first spatial hit.
-    // Godot parity: sfx_triggered.emit(event_name, []).
-    if (this.onSfxTriggered) this.onSfxTriggered(eventName, []);
+    // Fires only when a voice actually spawned — a cap/cooldown
+    // refusal is not an outcome. Godot parity: sfx_triggered.emit(event_name, []).
+    if (voices.length > 0 && this.onSfxTriggered) this.onSfxTriggered(eventName, []);
     return voices.length > 0 ? voices[0] : null;
   }
 
@@ -2825,6 +2861,9 @@ class PFAEvent {
       }
       this._eventGain.gain.cancelScheduledValues(0);
       this._eventGain.gain.setValueAtTime(0.0001, now);
+      // The entry rides the same anti-click floor: an authored 0
+      // or crossfadeTo(ev, 0) must not jump a fresh start to full in one step.
+      if (!(entryFadeDur > EVENT_FADE_FLOOR_SEC)) entryFadeDur = EVENT_FADE_FLOOR_SEC;
       // _eventGainTarget(): if the event was live-ducked before it (re)started,
       // the fresh-start ramp settles at the duck level, not full (neither stop()
       // nor play() clears _isDucked).
@@ -3120,7 +3159,7 @@ class PFAEvent {
    * Toggle a sub-level on or off.
    */
   toggleSubLevel(subName, enabled, fadeDuration = 0.5) {
-    if (!this.isPlaying) return;
+    if (!this.isPlaying) return false;
 
     const levelIdx = this.currentLevel;
     const key = `${levelIdx}_${subName}`;
@@ -3128,7 +3167,7 @@ class PFAEvent {
 
     if (!sub) {
       console.warn(`[PFA] Sub-level "${subName}" not found for level ${levelIdx}`);
-      return;
+      return false;
     }
 
     if (enabled) {
@@ -3142,6 +3181,7 @@ class PFAEvent {
       this._subLevelStates[subName] = {};
     }
     this._subLevelStates[subName].enabled = enabled;
+    return true;
   }
 
   setVolume(vol) {
@@ -3176,12 +3216,15 @@ class PFAEvent {
     // `_now()` +5ms) leaves a [now, anchor) gap that Web Audio renders at the gain's
     // INTRINSIC value — full for a playing event. So a stop()/anti-click fired at the
     // END of a fade-out (live value ≈ 0 but intrinsic ≈ full) would POP TO FULL for
-    // those few ms: the death-music crossfade "прорвала громкость" click, confirmed via
-    // OfflineAudioContext (peak 1.0 with the lookahead, ~0.04 without). cancelScheduledValues(0)
+    // those few ms: the death-music crossfade "broke through the volume" click, confirmed
+    // via OfflineAudioContext (peak 1.0 with the lookahead, ~0.04 without). cancelScheduledValues(0)
     // holds the live value across the audio thread's sub-quantum delay; read v0 BEFORE it.
     // Same no-gap rule as the level splice (PFATrack.activateLevel).
     const now = this.engine.ctx.currentTime;
     const v0 = from != null ? from : Math.max(0.0001, gain.value);
+    // Anti-click floor, zero included — see EVENT_FADE_FLOOR_SEC.
+    // The guarded form also catches NaN, which Math.max would pass through.
+    if (!(duration > EVENT_FADE_FLOOR_SEC)) duration = EVENT_FADE_FLOOR_SEC;
     gain.cancelScheduledValues(0);
     gain.setValueAtTime(v0, now);
     _applyFadeCurve(gain, v0, Math.max(0.0001, target), now, duration, curve);
@@ -5746,7 +5789,7 @@ class PFALiveConnect {
 }
 
 /** Engine version (also sent in the Live Connect hello). */
-PFA.VERSION = '1.16.1';
+PFA.VERSION = '1.16.2';
 
 // Browser global
 if (typeof window !== 'undefined') {

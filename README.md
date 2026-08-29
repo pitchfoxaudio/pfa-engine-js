@@ -198,10 +198,13 @@ Volume chain: `clip × track × event × group × master` — all linear, each s
 pfa.onEventStarted    = (name) => {};
 pfa.onEventStopped    = (name) => {};
 pfa.onLevelChanged    = (name, level) => {};
-pfa.onSfxTriggered    = (name, played) => {};          // played[] as awaited from trigger();
+pfa.onSfxTriggered    = (name, played) => {};          // an SFX actually fired — not called for a
+                                                       // refused trigger (cooldown / cap / chance);
+                                                       // played[] as awaited from trigger(),
                                                        // spatial triggers report an empty array
 pfa.onNodeChanged     = (name, nodeId, nodeName) => {};
-pfa.onSubLevelToggled = (name, subName, enabled) => {};
+pfa.onSubLevelToggled = (name, subName, enabled) => {}; // toggle APPLIED — silent on a no-op
+                                                        // (stopped event, unknown sub-level)
 pfa.onTransitionInfo  = (name, info) => {};            // see Transition Info below
 ```
 
@@ -255,6 +258,8 @@ await emitter.trigger('ball_roll');           // voices (incl. loops) now track 
 // when the object stops / dies:
 emitter.destroy();       // stops all its voices via each event's authored release_fade
 emitter.destroy(0);      // "as fast as click-free allows" (20 ms floor), not a hard cut
+emitter.destroy(250);    // explicit override — MILLISECONDS (250 = a quarter-second release);
+                         // the one fade argument in the API that is not seconds (Godot parity)
 ```
 
 A looping event (authored `loop {enabled, mode}` in Studio) keeps sounding until `destroy()` — `mode: "seamless"` is a native gapless loop, `mode: "smart"` re-triggers per cycle with fresh variation picks and play-chance rolls, crossfaded over 80 ms. `voice.detachFromEmitter()` freezes a voice at its current position.
@@ -392,6 +397,7 @@ Every start/stop/switch path has a floor — `0` always means "as fast as click-
 | Path | Protection |
 |------|-----------|
 | Play / level activation | 10 ms fade floor (`_FADE_ANTICLICK_FLOOR`) |
+| Event-level fades — `stop` / `crossfadeTo` / `fadeOut` / duck | 20 ms floor (`EVENT_FADE_FLOOR_SEC`), explicit `0` included |
 | Variation switch | 2 ms micro-crossfade at the splice |
 | Spatial voice stop (incl. `destroy(0)`, `stopAll(0)`, voice steal) | 20 ms floor (`SPATIAL_STOP_FLOOR_MS`) |
 | Smart-loop cycle seam | 80 ms crossfade |
@@ -434,9 +440,9 @@ This package versions independently from the rest of the suite (Studio 0.9.x, Go
 
 ## License
 
-**This engine is MIT** — free for commercial and personal use, no attribution required.
+**This engine is MIT** — free for commercial and personal use; no in-game credit required, just keep the MIT license file with the code.
 
-It plays packs authored in **PFA Studio**, a separate desktop application with its own license. The Studio beta is free for everyone. For commercial projects it stays free while your total annual gross revenue and funding are under USD $200,000; at or above that, beta builds stay free until a release version ships plus a 60-day transition, then commercial use needs a release license. Beta builds are never remotely disabled, and whatever you make with the Studio stays yours in all cases (full terms in the Studio EULA). The pack format is open: a plain-JSON `config.json` next to the audio files, or a single `.pfabank` container carrying that same JSON plus the audio — the engine reads either, whatever produced it.
+It plays packs authored in **PFA Studio**, a separate desktop application with its own license. The Studio beta is free for everyone. For commercial projects it stays free while your total annual gross revenue and funding stay under USD $200,000 — counted across a company and any group it belongs to, and across games and other interactive projects for individuals. At or above that threshold, and for all casino products regardless of revenue, beta builds stay free until a release version ships plus a 60-day transition; after that, commercial use needs a release license. Beta builds are never remotely disabled, and whatever you make with the Studio stays yours in all cases (full terms in the Studio EULA). The pack format is open: a plain-JSON `config.json` next to the audio files, or a single `.pfabank` container carrying that same JSON plus the audio — the engine reads either, whatever produced it.
 
 - Website: [pitchfoxaudio.com](https://pitchfoxaudio.com)
 - Support the project: [Buy Me a Coffee](https://buymeacoffee.com/pitchfoxaudio)
