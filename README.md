@@ -345,6 +345,7 @@ Web reverb details:
 - **`decay` is a true RT60** (seconds) on web — tail length is independent of `room_size`. (On Godot the tail rides room size; the exporter's per-platform `godot {}` zone overrides exist for exactly this.)
 - **`predelay_ms` is a true predelay** on web (plain DelayNode). 
 - The reverb core runs as an **AudioWorklet** (sample-accurate, compiled from an inline blob — no extra asset to ship). On browsers/contexts without worklets it falls back to a native-node graph that adds one render quantum (128 samples) of per-loop latency and a slight metallic tint — functional, but worklet is the intended path (HTTPS or localhost).
+- **Credit**: the comb/allpass network and its tunings are those of Freeverb by Jezar at Dreampoint (2000), released into the public domain; this engine reimplements the algorithm for the Web Audio worklet.
 
 ---
 
