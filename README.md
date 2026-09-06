@@ -164,11 +164,11 @@ Browsers expand compressed audio ~20× when decoding (1 MB OGG → ~60 MB PCM), 
 
 | Method | Description |
 |--------|-------------|
-| `pfa.navigate(event, trigger)` | Fire a transition by trigger name — returns `true` if one matched |
+| `pfa.navigate(event, trigger)` | Fire a transition by trigger name — returns `true` when the request was accepted: a route with that trigger leaves the current node (or, with none, a node carries the trigger and the first road out is taken) and the probability roll passed. `true` means scheduled, not yet applied — `onNodeChanged` marks the apply |
 | `pfa.getCurrentNode(event)` | Current node ID (or `null`) |
 | `pfa.toggleSubLevel(event, name, enabled, fade = 0.5)` | Toggle a sub-level layer on/off with a fade |
 
-Node graph activates when the config has `use_nodes: true`. The engine enters the entry node on `play()` (honoring `entry_fade`), auto-advances after `duration_bars × loop_count` when a transition has `auto: true`, falls back to a node's `terminal_fade` when there's no auto transition, fires stingers at transition start, and quantizes per cascade `connection.quantize → node.fade_quantize → event.switchQuantization`.
+Node graph activates when the config has `use_nodes: true`. The engine enters the entry node on `play()` (honoring `entry_fade`), auto-advances after `duration_bars × loop_count` when a transition has `auto: true`, falls back to a node's `terminal_fade` when there's no auto transition, fires stingers when the target node is entered (see Stingers for the per-kind moment), and quantizes per cascade `connection.quantize → node.fade_quantize → event.switchQuantization`.
 
 ### SFX
 
@@ -176,7 +176,7 @@ Node graph activates when the config has `use_nodes: true`. The engine enters th
 |--------|-------------|
 | `pfa.trigger(event, options?)` | Trigger a one-shot SFX. `options.intensity` (0..1) = per-trigger hit strength (see Intensity). **async** — fire and forget, or `await` it for `played[]`: one entry per track that fired, `{ track, behavior, variation, variationCount, algo, sample }` |
 
-Cooldown (`cooldown_ms`) and voice cap (`max_instances`, oldest voice stolen) are authored per event in Studio and enforced by the engine. `always_play` layers fire on every level; each fired layer picks a fresh sample variation (switch_chance-gated) with clip trim + fades applied.
+Cooldown (`cooldown_ms`) and voice cap (`max_instances`: the least audible voice is stolen — quietest first, oldest on a tie — and a new trigger quieter than every live voice is rejected; see Voice management) are authored per event in Studio and enforced by the engine. `always_play` layers fire on every level; each fired layer picks a fresh sample variation (switch_chance-gated) with clip trim + fades applied.
 
 ### Volume & Ducking
 
@@ -237,7 +237,7 @@ Coordinate system is right-handed, +X right, +Y up, −Z forward (Web Audio conv
 
 ```javascript
 pfa.triggerSpatial('ball_hit', x, y);            // 2D
-pfa.triggerSpatial('explosion', x, y, z);        // 3D (z present ⇒ 3D path)
+pfa.triggerSpatial('explosion', x, y, z);        // 3D — for an event authored 3D (or { mode: '3D' } passed as 5th arg); z alone keeps the 2D path
 pfa.triggerSpatial('ball_hit', x, y, { intensity: 0.8 });   // with per-trigger override
 ```
 
@@ -300,9 +300,9 @@ Game-side overrides use the engine's cfg shape (camelCase, nested attenuation) �
 
 ### Voice management & stopping
 
-- **`max_instances`** (authored per event, default 8): at the cap the oldest voice is stolen — stopped through its release path, so steals are click-free.
+- **`max_instances`** (authored per event, default 8): at the cap the **least audible** voice is stolen (score = per-voice gain incl. intensity × distance attenuation at the listener; equal scores → oldest dies), released through its fixed anti-click seam (never the authored `release_fade`), so steals are click-free. A candidate quieter than every live voice is **rejected** — it doesn't start and kills nothing.
 - **Stopping is never a hard cut**: every spatial voice stop — `voice.stop(0)`, `emitter.destroy(0)`, `stopAll(0)`, voice steal — is floored to **20 ms** (`SPATIAL_STOP_FLOOR_MS`). A loop cut mid-wave is a step discontinuity (an audible click); one-shots simply end and never hit this path.
-- **`release_fade`** (authored per event): the default stop fade wherever no explicit fade is passed — `stop(name)`, `emitter.destroy()`, voice steal. *How* an event ends lives in the editor, not in game code.
+- **`release_fade`** (authored per event): the default stop fade wherever no explicit fade is passed — `stop(name)`, `emitter.destroy()`. *How* an event ends lives in the editor, not in game code.
 
 ### Intensity (per-trigger velocity)
 
@@ -359,7 +359,7 @@ FMOD/Wwise pattern: on `play()` all level layers start simultaneously at gain 0 
 ### Conductor (bar-counting scheduler)
 A single chained tick per event from `play()` to `stop()`; each tick reads the current bar duration, so per-node BPM changes apply on the next tick. It drives:
 
-- **Play chance** — per-track probability rolled at bar boundaries (never on `navigate()`), with committed state (a track locks for N bars after its roll — rapid navigation can't pump amplitudes). Modes: `true_random`, `weighted_history` (anti-streak), `shuffle_bag` (exact distribution).
+- **Play chance** — per-track probability rolled at bar boundaries (never on `navigate()`), with committed state (a track locks for N bars after its roll — rapid navigation can't pump amplitudes). Modes: `true_random`, `weighted_history` (anti-streak), `shuffle_bag` (a ten-slot bag with the rounded share of hits — exact at multiples of 10%).
 - **Sample variation switching** — swap the playing sample at the loop boundary (JIT stop+start, 2 ms micro-crossfade), `switchBars = loopBars × repeatCount`. Algorithms: `random`, `weighted`, `no_repeat` (shuffle bag).
 - **Quantized transitions** — level/node switches scheduled at the next bar/beat; a new transition cancels a pending one.
 
@@ -373,7 +373,7 @@ Per-connection `kind`: **`crossfade`** (default — old level down while new lev
 Per-node `bpm` / `time_signature` (flattened from Tempo nodes by the exporter) update the conductor on entry. `free_tempo` nodes disable quantization (transitions become instant; auto-advance uses `clip_length × loop_count` instead of bar math). `restart_on_entry: true` resets a node's phase on every entry (fresh source, variation pick preserved) instead of staying loop-locked to the event clock.
 
 ### Stingers
-A one-shot bundle on a transition (`connection.stinger {samples, clips, volume, play_chance, mode}`), fired automatically at the **start** of the fade (t=0 — covering transients that short crossfades would eat). Picker modes `random` / `weighted` / `no_repeat`, with independent history per connection. There is no separate API — stingers are a side effect of transitions.
+A one-shot bundle on a transition (`connection.stinger {samples, clips, volume, play_chance, mode}`), fired when the **target node is entered**. For `crossfade` and `fade_in` that is the start of the fade (t=0 — covering transients that short crossfades would eat); a `fade_out → fade_in` chain enters the target after the exit ramp, so its stinger rides the fade-in half (Studio doesn't author stingers on plain fade-out transitions). Picker modes `random` / `weighted` / `no_repeat`, with independent history per connection. There is no separate API — stingers are a side effect of transitions.
 
 ### Transition Info
 
@@ -421,7 +421,7 @@ live.connect();      // auto-reconnects every 5 s until the editor appears
 live.disconnect();
 ```
 
-Handled editor commands: `reload` (stop-all + re-fetch config + re-preload), `set_volume`, `set_level`, `play`, `stop`, `trigger`, `set_group_volume`, `set_master_volume`, `set_mute`, `duck`, `unduck`. On **Sync** in Studio the game reloads the pack and fires `onReload` — destroy and re-create your spatial emitters there (see the billiards demo). A reload that can't be loaded (Studio mid-write, wrong path) is refused: the running pack keeps playing and `onReload` does not fire.
+Handled editor commands: `reload` (stop-all + re-fetch config + re-preload), `set_volume`, `set_level`, `play`, `stop`, `trigger`, `set_group_volume`, `set_master_volume`, `set_mute`, `duck`, `unduck`. On **Sync** in Studio the game reloads the pack and fires `onReload` — destroy and re-create your spatial emitters there (see the billiards demo). A reload that can't be loaded (Studio mid-write, wrong path) is refused: the previous pack stays loaded and playable, but its voices were already stopped by the reload's stop-all — re-trigger what should play; `onReload` does not fire. (A direct `loadPack()` refusal outside Live Connect stops nothing.)
 
 ---
 
