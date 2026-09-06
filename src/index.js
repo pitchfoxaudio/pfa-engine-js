@@ -2675,6 +2675,13 @@ class PFAEvent {
     this.nodeGraph = data.node_graph || null;
     this.currentNode = null;
     this._autoAdvanceTimer = null;
+    // The authored endpoint of the current section's repeats (AudioContext
+    // time): entry + duration_bars × loop_count bars. The timer that reaches
+    // it may run late; the route it chooses quantizes against THIS moment,
+    // and the next section counts its repeats from it — so a chain of
+    // automatic sections holds the grid instead of drifting by the timers'
+    // lateness. Godot parity: `_auto_advance_at`.
+    this._autoAdvanceAt = null;
     this._pendingLevelSwitch = null;  // setTimeout ID for quantized setLevel
     this._entryFadeOverride = null;   // one-shot crossfadeTo fade-in; consumed by play()
     this._pendingNodeTransition = null;  // setTimeout ID for quantized navigate
@@ -2715,6 +2722,13 @@ class PFAEvent {
     this._reverbSend = null;
     // Playback start time (for syncing tracks)
     this._playStartTime = 0;
+    // Origin of the bar grid (`_calcNextBarBoundary` / `_calcNextBeatBoundary`
+    // count bars from here at the CURRENT bar length). It is the play start
+    // until the bar length changes — a section carrying a Tempo node starts
+    // its own grid at the moment it is entered (`_syncBarDurationToCurrentNode`).
+    // A same-tempo section entered mid-bar keeps the grid the event plays on.
+    // Godot parity: `_bar_grid_anchor`.
+    this._barGridAnchor = 0;
   }
 
   _parseSubLevels(data) {
@@ -2754,17 +2768,18 @@ class PFAEvent {
 
     // Load stinger bundles from node graph connections.
     // v2 shape: connection.stinger is a Dictionary { samples, clips, volume, play_chance, mode }
-    // (was: a single string path). Bundles are keyed by `${src}::${tgt}` so a stinger
-    // node attached to N fade-nodes loads N independent bundles (1:N reuse) and each
-    // fire site keeps independent no-repeat state.
+    // (was: a single string path). Bundles are keyed by the ROW's identity —
+    // `_stingerKeyOf(conn)`: the exporter's `id` (`A>B|X`: the pair, then the
+    // transition node walked), so two roads between one pair and the two
+    // directions of one transition each own a bundle and a no-repeat history.
+    // A row without an id (older configs) keys by the pair `${src}::${tgt}`.
     if (this.nodeGraph) {
       this._stingerBundles = {};
       const stingerPromises = [];
       for (const conn of (this.nodeGraph.connections || [])) {
         const sd = conn.stinger;
         if (sd && typeof sd === 'object' && Array.isArray(sd.samples) && sd.samples.length > 0) {
-          const key = `${conn.source}::${conn.target}`;
-          stingerPromises.push(this._loadStingerBundle(key, sd));
+          stingerPromises.push(this._loadStingerBundle(this._stingerKeyOf(conn), sd));
         }
       }
       await Promise.all(stingerPromises);
@@ -2896,6 +2911,7 @@ class PFAEvent {
       _applyFadeCurve(this._eventGain.gain, 0.0001, this._eventGainTarget(),
                        now, entryFadeDur, entryFadeCurve);
       this._playStartTime = now;
+      this._barGridAnchor = now;
     }
 
     if (this.useNodes && this.nodeGraph) {
@@ -2929,6 +2945,8 @@ class PFAEvent {
 
   stop() {
     this.isPlaying = false;
+    // A smart flat loop must not spawn its next pass behind the stop.
+    this._stopFlatLoops();
     // Reset node graph state so next play() starts fresh from entry_node
     this.currentNode = null;
     this.currentLevel = 0;
@@ -2937,6 +2955,7 @@ class PFAEvent {
       clearTimeout(this._autoAdvanceTimer);
       this._autoAdvanceTimer = null;
     }
+    this._autoAdvanceAt = null;
     // Cancel pending quantized transitions
     if (this._pendingLevelSwitch) {
       clearTimeout(this._pendingLevelSwitch);
@@ -3065,6 +3084,8 @@ class PFAEvent {
       const voice = track.triggerSfx(this.currentLevel, this._eventGain, iv);
       if (voice) {
         this._activeVoices.push(voice);
+        // A smart loop: this pass plays once, the next is spawned a cycle later.
+        if (voice.loopMode === 'smart') this._scheduleFlatReloop(voice, track, iv);
         played.push({
           track: voice.track, behavior: voice.behavior,
           variation: voice.variation, variationCount: voice.variationCount,
@@ -3073,6 +3094,41 @@ class PFAEvent {
       }
     }
     return played;
+  }
+
+  /**
+   * Smart loop on a flat voice: re-trigger `track` one clip cycle later so a
+   * fresh variation + randomization is picked, crossfading the new voice in
+   * over the seam and the current one out. Each spawned voice chains the next;
+   * the chain ends when its voice stops by any other hand — stop(), a steal
+   * (the voice reads inactive at the tick) — and stop() clears the timer. The
+   * spatial twin is `_scheduleSmartReloop`; the Godot addon's flat twin is
+   * `_flat_smart_tick`. The first trigger rolled play_chance; a cycle does not.
+   */
+  _scheduleFlatReloop(voice, track, iv) {
+    const CROSS = 0.08;   // 80 ms crossfade seam
+    const period = Math.max(0.05, (voice.clipLen || 0) - CROSS) * 1000;
+    voice._reloopTimer = setTimeout(() => {
+      voice._reloopTimer = null;
+      if (!voice.isActive()) return;   // stopped / stolen before the boundary
+      const next = track.triggerSfx(this.currentLevel, this._eventGain, iv, true);
+      if (!next) return;               // buffer vanished — let the current voice finish out
+      this._activeVoices.push(next);
+      const now = this.engine._now();
+      const tgt = next._target != null ? next._target : 1.0;
+      next._voiceGain.gain.cancelScheduledValues(now);
+      next._voiceGain.gain.setValueAtTime(0, now);
+      next._voiceGain.gain.linearRampToValueAtTime(tgt, now + CROSS);
+      voice.fadeStop(CROSS);
+      this._scheduleFlatReloop(next, track, iv);
+    }, period);
+  }
+
+  /** End every flat smart-loop chain (stop() / fadeOut() of an SFX event). */
+  _stopFlatLoops() {
+    for (const v of (this._activeVoices || [])) {
+      if (v._reloopTimer) { clearTimeout(v._reloopTimer); v._reloopTimer = null; }
+    }
   }
 
   setLevel(level) {
@@ -3146,10 +3202,13 @@ class PFAEvent {
       const outgoing = connections.filter(c =>
         c.source === this.currentNode && c.conn_type === 'transition'
       );
+      // A direct edge carries no fade fields: they resolve to the EVENT's
+      // fade_duration / fade_curve / switch_quantization, never to residue
+      // on a section node (Godot parity: `navigate`'s fallback).
       const fallbackFade = outgoing.length > 0 ? {
-        fade_duration: outgoing[0].fade_duration,
-        fade_curve: outgoing[0].fade_curve,
-        quantize: outgoing[0].quantize,
+        fade_duration: outgoing[0].fade_duration ?? this.fadeDuration,
+        fade_curve: outgoing[0].fade_curve ?? this.fadeCurve,
+        quantize: outgoing[0].quantize ?? this.switchQuantization,
         kind: outgoing[0].kind ?? 'crossfade',
         fade_direction: outgoing[0].fade_direction ?? 'both',
         stinger: outgoing[0].stinger,
@@ -3265,6 +3324,8 @@ class PFAEvent {
 
   fadeOut(duration, curve = 'equal_power') {
     if (!this._eventGain) return;
+    // A smart flat loop must not spawn its next pass behind the fade.
+    this._stopFlatLoops();
     this._tweenEventGain(0.0001, duration, curve);
 
     if (this._fadeOutTimer) clearTimeout(this._fadeOutTimer);
@@ -3276,11 +3337,16 @@ class PFAEvent {
 
   // ── Node Graph Internal ──
 
+  /** The key a connection row's stinger bundle lives under (see loadBuffers). */
+  _stingerKeyOf(conn) {
+    return conn.id ? String(conn.id) : `${conn.source}::${conn.target}`;
+  }
+
   /**
    * Resolve the authored fade settings on a graph connection so a caller that
    * navigates src → tgt can honor the composer's duration/curve/quantize/kind
-   * rather than falling back to target node defaults. Godot parity:
-   * `_find_connection_fade` (pfa_event.gd:207).
+   * rather than falling back to the event defaults. Godot parity:
+   * `_find_connection_fade`.
    */
   _findConnectionFade(src, tgt) {
     if (!src || !tgt || !this.nodeGraph) return {};
@@ -3293,6 +3359,7 @@ class PFAEvent {
           kind: c.kind ?? 'crossfade',
           fade_direction: c.fade_direction ?? 'both',
           stinger: c.stinger,
+          stinger_key: this._stingerKeyOf(c),
         };
         // Phase 3 chain fields: exporter flattens fade_out→fade_in→tgt into
         // a single connection carrying both exit and entry fade settings.
@@ -3342,7 +3409,14 @@ class PFAEvent {
     this.engine.onTransitionInfo?.(this.name, info);
   }
 
-  _enterNode(nodeId, fadeSettings) {
+  /**
+   * Enter `nodeId` with the route's `fadeSettings` (a connection row's fields,
+   * resolved by the caller). `atTime` is the authored moment the request
+   * stands for when it is not "now": the automatic exit passes the endpoint of
+   * the section's repeats, so the route quantizes against the endpoint and the
+   * entered section counts its own repeats from it. Godot parity: `_enter_node`.
+   */
+  _enterNode(nodeId, fadeSettings, atTime = null) {
     if (!this.nodeGraph || !this.nodeGraph.nodes[nodeId]) {
       console.warn(`[PFA] Node not found: ${nodeId}`);
       return;
@@ -3354,12 +3428,20 @@ class PFAEvent {
     // Get the level index that this node maps to
     const targetLevel = node.level_index !== undefined ? node.level_index : 0;
 
-    // Determine fade settings (from transition connection or node defaults)
-    const fadeDuration = fadeSettings?.fade_duration ?? node.fade_duration ?? this.fadeDuration;
-    const fadeCurve = fadeSettings?.fade_curve ?? node.fade_curve ?? this.fadeCurve;
+    // Fade settings: the route's own, else the event's. A section node's
+    // fade_* fields are the Node Editor's residue (a transition node's
+    // defaults serialized on every node) — not a transition's settings.
+    const fadeDuration = fadeSettings?.fade_duration ?? this.fadeDuration;
+    const fadeCurve = fadeSettings?.fade_curve ?? this.fadeCurve;
 
-    // Determine quantization (connection → node → event default)
-    const quantize = fadeSettings?.quantize ?? node.fade_quantize ?? this.switchQuantization ?? 'instant';
+    // Quantization: the route's own, else the event's Switch. A target with
+    // `restart_on_entry` waits for the next BAR regardless: its clip starts
+    // from sample 0 at the switch, and for that to sit on the pulse the switch
+    // must be a bar line — "beat 1 at an arbitrary sample" is not a thing.
+    // Leaving a Free-tempo section there is no grid, so `_getQuantizedTime`
+    // makes even that entry instant. Preview parity: `_route_switch_position`.
+    let quantize = fadeSettings?.quantize ?? this.switchQuantization ?? 'instant';
+    if (node.restart_on_entry) quantize = 'bar';
 
     if (oldNode === null) {
       // First node — no quantization, apply immediately
@@ -3374,19 +3456,24 @@ class PFAEvent {
         }
       }
       this._stopAllSubLevels();
-      this._syncBarDurationToCurrentNode();
-      this._scheduleAutoAdvance(node);
+      // The first section starts on the play start — the grid's origin and
+      // the moment its repeats count from.
+      this._syncBarDurationToCurrentNode(this._playStartTime);
+      this._scheduleAutoAdvance(node, this._playStartTime);
       console.log(`[PFA] Entered node "${node.name}" (${nodeId}), level=${targetLevel}`);
     } else {
-      // Node transition — check quantization
-      const boundary = this._getQuantizedTime(quantize);
+      // Node transition — check quantization (against the authored moment
+      // when the request stands for one: the automatic exit's endpoint).
+      const boundary = this._getQuantizedTime(quantize, atTime);
 
       if (boundary) {
         // Schedule delayed transition
         this._scheduleNodeTransition(nodeId, node, targetLevel, fadeDuration, fadeSettings, boundary);
       } else {
-        // Instant — apply now
-        this._applyNodeTransition(nodeId, node, targetLevel, fadeDuration, fadeSettings);
+        // Instant — apply now. An automatic exit that lands instantly still
+        // dates the entry at its endpoint, so the next repeats count from
+        // the grid, not from the timer's lateness.
+        this._applyNodeTransition(nodeId, node, targetLevel, fadeDuration, fadeSettings, atTime);
       }
     }
   }
@@ -3399,22 +3486,24 @@ class PFAEvent {
    * fade_out→fade_in chain not yet supported — exporter doesn't emit the
    * metadata yet; fade_out here always hard-switches at fade_end.
    */
-  _applyNodeTransition(nodeId, node, targetLevel, fadeDuration, fadeSettings) {
+  _applyNodeTransition(nodeId, node, targetLevel, fadeDuration, fadeSettings, entryTime = null) {
     if (this._pendingFadeOutSwitch) {
       clearTimeout(this._pendingFadeOutSwitch);
       this._pendingFadeOutSwitch = null;
     }
     const fromNodeId = this.currentNode;
     const kind = fadeSettings?.kind ?? 'crossfade';
+    // `entryTime` = the authored moment of this switch (the boundary it was
+    // scheduled on, or the automatic endpoint that chose it); null = now.
     switch (kind) {
       case 'fade_in':
-        this._applyTransitionFadeIn(nodeId, node, targetLevel, fadeDuration, fadeSettings, fromNodeId);
+        this._applyTransitionFadeIn(nodeId, node, targetLevel, fadeDuration, fadeSettings, fromNodeId, entryTime);
         break;
       case 'fade_out':
-        this._applyTransitionFadeOut(nodeId, node, targetLevel, fadeDuration, fadeSettings, fromNodeId);
+        this._applyTransitionFadeOut(nodeId, node, targetLevel, fadeDuration, fadeSettings, fromNodeId, entryTime);
         break;
       default:
-        this._applyTransitionCrossfade(nodeId, node, targetLevel, fadeDuration, fadeSettings, fromNodeId);
+        this._applyTransitionCrossfade(nodeId, node, targetLevel, fadeDuration, fadeSettings, fromNodeId, entryTime);
     }
   }
 
@@ -3433,7 +3522,7 @@ class PFAEvent {
     }
   }
 
-  _applyTransitionCrossfade(nodeId, node, targetLevel, fd, fadeSettings, fromNodeId) {
+  _applyTransitionCrossfade(nodeId, node, targetLevel, fd, fadeSettings, fromNodeId, entryTime = null) {
     this.currentNode = nodeId;
     this.currentLevel = targetLevel;
     const curve = fadeSettings?.fade_curve ?? this.fadeCurve;
@@ -3441,10 +3530,11 @@ class PFAEvent {
       if (track.levelBehavior === 'always_play' || track.levelBehavior === 'level_conditional') continue;
       track.activateLevel(targetLevel, fd, curve);
     }
-    this._postTransitionCommon(nodeId, node, targetLevel, fadeSettings, 'crossfade', fd, fromNodeId);
+    this._applySharedChanceForLevel(targetLevel, fd);
+    this._postTransitionCommon(nodeId, node, targetLevel, fadeSettings, 'crossfade', fd, fromNodeId, entryTime);
   }
 
-  _applyTransitionFadeIn(nodeId, node, targetLevel, fd, fadeSettings, fromNodeId) {
+  _applyTransitionFadeIn(nodeId, node, targetLevel, fd, fadeSettings, fromNodeId, entryTime = null) {
     this.currentNode = nodeId;
     this.currentLevel = targetLevel;
     const ANTI_CLICK = 0.01;
@@ -3461,15 +3551,20 @@ class PFAEvent {
       track._rampLevelGain(targetLevel, targetVol, fd, curve);
       track._activeLevel = targetLevel;
     }
-    this._postTransitionCommon(nodeId, node, targetLevel, fadeSettings, 'fade_in', fd, fromNodeId);
+    this._applySharedChanceForLevel(targetLevel, fd);
+    this._postTransitionCommon(nodeId, node, targetLevel, fadeSettings, 'fade_in', fd, fromNodeId, entryTime);
   }
 
-  _applyTransitionFadeOut(nodeId, node, targetLevel, fd, fadeSettings, fromNodeId) {
+  _applyTransitionFadeOut(nodeId, node, targetLevel, fd, fadeSettings, fromNodeId, entryTime = null) {
     // Cancel auto-advance — it would fire mid-fade on the OLD node.
     if (this._autoAdvanceTimer) {
       clearTimeout(this._autoAdvanceTimer);
       this._autoAdvanceTimer = null;
     }
+    this._autoAdvanceAt = null;
+    // The hand-over is dated at the ramp's authored end: the NEW section
+    // starts there and counts its repeats from it.
+    const handOverAt = (entryTime ?? this.engine._now()) + fd;
     const exitCurve = fadeSettings?.fade_curve ?? this.fadeCurve;
     // Phase 3 chain fields (exporter-flattened from fade_out→fade_in→target).
     // When present, NEW level ramps 0→volume over entryFd after the switch
@@ -3511,23 +3606,30 @@ class PFAEvent {
         // entryFd>0 → target level ramps up with entryCurve (chain).
         track.activateLevel(targetLevel, entryFd, entryCurve);
       }
+      this._applySharedChanceForLevel(targetLevel, entryFd);
       const label = entryFd > 0 ? 'fade_out/fade_in' : 'fade_out/switch';
-      this._postTransitionCommon(nodeId, node, targetLevel, fadeSettings, label, entryFd, fromNodeId);
+      this._postTransitionCommon(nodeId, node, targetLevel, fadeSettings, label, entryFd, fromNodeId, handOverAt);
     }, (fd + 0.005) * 1000);
   }
 
-  _postTransitionCommon(nodeId, node, targetLevel, fadeSettings, kindLabel, fd, fromNodeId) {
-    // Stinger fires at the post-transition moment. Bundle was loaded under the
-    // `${src}::${tgt}` connection key in loadBuffers(); we recompute the key here.
+  _postTransitionCommon(nodeId, node, targetLevel, fadeSettings, kindLabel, fd, fromNodeId, entryTime = null) {
+    // Stinger fires at the post-transition moment, from the bundle of the ROW
+    // that was played (`stinger_key`, set by _executeTransition /
+    // _findConnectionFade); the pair key is the fallback for a caller that
+    // resolved no row.
     if (fadeSettings?.stinger && fromNodeId) {
-      this._playStinger(`${fromNodeId}::${nodeId}`);
+      this._playStinger(fadeSettings.stinger_key ?? `${fromNodeId}::${nodeId}`);
     }
     if (node.restart_on_entry) {
       this._restartAllPlayersOfLevel(targetLevel);
     }
     this._stopAllSubLevels();
-    this._syncBarDurationToCurrentNode();
-    this._scheduleAutoAdvance(node);
+    // The entered section's authored start: the boundary the switch was
+    // scheduled on / the automatic endpoint that chose it / the Fade Out's
+    // hand-over; now for an instant click. The grid re-anchors here when the
+    // bar length changes, and the repeats count from here.
+    this._syncBarDurationToCurrentNode(entryTime);
+    this._scheduleAutoAdvance(node, entryTime);
     const fromName = this._resolveNodeName(fromNodeId);
     const direction = fadeSettings?.fade_direction ?? 'both';
     console.log(`[PFA] Entered node "${node.name}" (${nodeId}), level=${targetLevel}, kind=${kindLabel}, dir=${direction}, fd=${fd.toFixed(2)}s, from="${fromName}"`);
@@ -3554,17 +3656,28 @@ class PFAEvent {
     this._pendingNodeTransition = setTimeout(() => {
       this._pendingNodeTransition = null;
       if (!this.isPlaying) return;
-      this._applyNodeTransition(nodeId, node, targetLevel, fadeDuration, fadeSettings);
+      // The switch is dated at the boundary it was scheduled on, not at the
+      // moment the timer reached it.
+      this._applyNodeTransition(nodeId, node, targetLevel, fadeDuration, fadeSettings, whenTime);
       console.log(`[PFA] Quantized node transition applied`);
     }, Math.max(0, delay));
   }
 
-  _executeTransition(connection) {
+  /**
+   * Play one connection row. Fields the row omits resolve to the EVENT's
+   * fade_duration / fade_curve / switch_quantization — a direct edge (no
+   * transition node) ships none, and a section node's residue is not a
+   * transition's settings (Godot parity: `_execute_transition`). `atTime`:
+   * the authored moment of the request when it is not "now" (the automatic
+   * exit's endpoint).
+   */
+  _executeTransition(connection, atTime = null) {
     const fs = {
-      fade_duration: connection.fade_duration,
-      fade_curve: connection.fade_curve,
-      quantize: connection.quantize,
+      fade_duration: connection.fade_duration ?? this.fadeDuration,
+      fade_curve: connection.fade_curve ?? this.fadeCurve,
+      quantize: connection.quantize ?? this.switchQuantization,
       stinger: connection.stinger,
+      stinger_key: this._stingerKeyOf(connection),
       kind: connection.kind ?? 'crossfade',
       fade_direction: connection.fade_direction ?? 'both',
     };
@@ -3572,7 +3685,7 @@ class PFAEvent {
       fs.entry_fade_duration = connection.entry_fade_duration;
       fs.entry_fade_curve = connection.entry_fade_curve ?? 'equal_power';
     }
-    this._enterNode(connection.target, fs);
+    this._enterNode(connection.target, fs, atTime);
   }
 
   // ── Conductor: bar-counting scheduler for play_chance (FMOD/Wwise pattern) ──
@@ -3585,13 +3698,15 @@ class PFAEvent {
     const bpm = this.bpm;
     const beatsPerBar = this.timeSignature[0] || 4;
     this._barDurationSec = (60 / bpm) * beatsPerBar;
+    this._barGridAnchor = this._playStartTime;
     this._barCounter = 0;
 
     // Initial roll for all tracks at bar 0
     this._initialPlayChanceRoll();
 
-    // Sync bar duration to current node (may override event BPM via Tempo flatten).
-    this._syncBarDurationToCurrentNode();
+    // Sync bar duration to current node (may override event BPM via Tempo
+    // flatten) — the grid still starts at the play start.
+    this._syncBarDurationToCurrentNode(this._playStartTime);
     this._scheduleNextBarTick();
   }
 
@@ -3630,7 +3745,12 @@ class PFAEvent {
 
     for (let i = 0; i < this.tracks.length; i++) {
       const track = this.tracks[i];
-      if (track.levelBehavior === 'always_play' || track.levelBehavior === 'level_conditional') continue;
+      // A shared (all levels) track rolls too: its metadata block carries a
+      // play chance per level (the preview rolls play_chance_per_level for it
+      // as for a level-specific track), and the verdict of the level that
+      // plays gates the ONE shared lane (_applyChanceGain on its track gain).
+      // A shared track without the block has no level entries — nothing to
+      // roll, the lane plays.
 
       const levelsState = {};
       for (const lvlStr of Object.keys(track.levelSamples)) {
@@ -3822,31 +3942,51 @@ class PFAEvent {
   }
 
   /**
-   * Calculate next bar boundary in AudioContext time.
+   * Calculate next bar boundary in AudioContext time, on the grid anchored at
+   * `_barGridAnchor` (the play start, or the entry of the section whose Tempo
+   * node changed the bar length).
+   *
+   * Two callers, two rules. A click (`refTime` null) asks for the next bar
+   * from NOW, and a boundary closer than 10 ms is pushed a bar on — a ramp
+   * cannot be armed on a line already under the playhead. The automatic exit
+   * passes the endpoint of its section's repeats as `refTime`: that endpoint
+   * IS a bar line whenever the section was entered on one, so the boundary
+   * at or just before it (within the loop boundaries' ~33 ms jitter window)
+   * is the answer even though the timer that reached it came late — the
+   * near-now guard applied here a second time made every bar-quantized
+   * automatic route wait a full extra bar. A past boundary applies at once.
+   * Godot parity: `_calc_next_bar_boundary`.
    */
-  _calcNextBarBoundary() {
+  _calcNextBarBoundary(refTime = null) {
     const now = this.engine.ctx.currentTime;
     if (!this._barDurationSec || this._barDurationSec <= 0) return now;
-    const elapsed = now - this._playStartTime;
-    const barsSoFar = Math.ceil(elapsed / this._barDurationSec);
-    let boundary = this._playStartTime + barsSoFar * this._barDurationSec;
-    if (boundary - now < 0.01) boundary += this._barDurationSec;
-    return boundary;
+    return this._nextGridLine(this._barDurationSec, now, refTime);
   }
 
   /**
-   * Calculate next beat boundary in AudioContext time.
+   * Calculate next beat boundary in AudioContext time (same rules as the bar).
    */
-  _calcNextBeatBoundary() {
+  _calcNextBeatBoundary(refTime = null) {
     const beatsPerBar = this.timeSignature[0] || 4;
     const beatDurationSec = this._barDurationSec / beatsPerBar;
     if (beatDurationSec <= 0) return this.engine.ctx.currentTime;
-    const now = this.engine.ctx.currentTime;
-    const elapsed = now - this._playStartTime;
-    const beatsSoFar = Math.ceil(elapsed / beatDurationSec);
-    let boundary = this._playStartTime + beatsSoFar * beatDurationSec;
-    if (boundary - now < 0.01) boundary += beatDurationSec;
-    return boundary;
+    return this._nextGridLine(beatDurationSec, this.engine.ctx.currentTime, refTime);
+  }
+
+  _nextGridLine(period, now, refTime) {
+    const anchor = this._barGridAnchor ?? this._playStartTime;
+    if (refTime != null) {
+      // The authored endpoint: the line at or just before it wins.
+      const linesSoFar = Math.ceil((refTime - anchor) / period);
+      const line = anchor + linesSoFar * period;
+      const prev = line - period;
+      if (prev >= anchor - 0.001 && refTime - prev < 0.033) return prev;
+      return line;
+    }
+    const linesSoFar = Math.ceil((now - anchor) / period);
+    let line = anchor + linesSoFar * period;
+    if (line - now < 0.01) line += period;
+    return line;
   }
 
   /**
@@ -3856,13 +3996,15 @@ class PFAEvent {
    * If the current node has `free_tempo: true`, force instant — no bar/beat
    * grid exists to snap to. Covers level switches, node transitions, and
    * connection-level quantize overrides since they all route through here.
-   * Editor parity: its _compute_scheduled_switch_position.
-   * Godot parity: `_get_quantized_time` (pfa_event.gd:839).
+   * `refTime`: the authored moment the request stands for (the automatic
+   * exit's endpoint) — see `_calcNextBarBoundary`.
+   * Preview parity: `_compute_scheduled_switch_position`.
+   * Godot parity: `_get_quantized_time`.
    */
-  _getQuantizedTime(quantize) {
+  _getQuantizedTime(quantize, refTime = null) {
     if (this._isCurrentNodeFreeTempo()) return null;
-    if (quantize === 'bar') return this._calcNextBarBoundary();
-    if (quantize === 'beat') return this._calcNextBeatBoundary();
+    if (quantize === 'bar') return this._calcNextBarBoundary(refTime);
+    if (quantize === 'beat') return this._calcNextBeatBoundary(refTime);
     return null; // instant/immediate — no delay
   }
 
@@ -3876,11 +4018,15 @@ class PFAEvent {
    * Update `_barDurationSec` from the current node's BPM/time_signature (the
    * exporter flattens a Tempo node's overrides into these fields on the target
    * loop node). When the bar duration changes, the chained conductor setTimeout
-   * picks up the new value on the next tick. Call sites: first-node branch of
-   * _enterNode, _postTransitionCommon, _startConductor. Godot parity:
-   * `_sync_bar_duration_to_current_node` (pfa_event.gd:1727).
+   * picks up the new value on the next tick, and the bar grid is re-anchored
+   * at `anchorTime` (the section's authored entry; now when null) — the new
+   * tempo's bar lines run from the moment it took over, not from the play
+   * start at the new bar length, which put every later boundary on an
+   * arbitrary phase. An unchanged bar length keeps the grid. Call sites:
+   * first-node branch of _enterNode, _postTransitionCommon, _startConductor.
+   * Godot parity: `_sync_bar_duration_to_current_node`.
    */
-  _syncBarDurationToCurrentNode() {
+  _syncBarDurationToCurrentNode(anchorTime = null) {
     if (!this.currentNode || !this.nodeGraph) return;
     const node = this.nodeGraph.nodes?.[this.currentNode];
     if (!node) return;
@@ -3888,7 +4034,11 @@ class PFAEvent {
     const nodeTs = node.time_signature || this.timeSignature;
     const beatsPerBar = nodeTs?.[0] || 4;
     if (nodeBpm > 0 && beatsPerBar > 0) {
-      this._barDurationSec = (60 / nodeBpm) * beatsPerBar;
+      const barSec = (60 / nodeBpm) * beatsPerBar;
+      if (Math.abs(barSec - (this._barDurationSec || 0)) > 1e-9) {
+        this._barDurationSec = barSec;
+        this._barGridAnchor = anchorTime ?? this.engine._now();
+      }
     }
   }
 
@@ -3906,25 +4056,33 @@ class PFAEvent {
    * explicit `_transition_gen` guard because SceneTreeTimer lambdas can't be
    * cancelled sample-accurately; Web Audio handles it natively.
    */
-  _applyChanceGain(track, level, playing, whenTime) {
-    const g = track._levelGains[level];
+  _applyChanceGain(track, level, playing, whenTime, fadeOverride = null) {
+    // The lane the verdict gates: a level_specific track's level gain, a
+    // shared (all levels) track's ONE track gain — whatever the level the
+    // verdict belongs to. Its bookkeeping lives under the 'shared' key.
+    const isShared = track.levelBehavior === 'always_play' || track.levelBehavior === 'level_conditional';
+    const key = isShared ? 'shared' : level;
+    const g = isShared ? track._trackGain : track._levelGains[level];
     if (!g) return;
 
     const targetVol = playing ? track.volume : 0;
-    const fadeSec = track.chanceFadeMode === 'fade' ? track.chanceFadeDuration : 0.01;
+    // The reroll's ramp is the chance fade; a level change applying the new
+    // level's verdict to a shared lane passes the transition's own fade.
+    const fadeSec = fadeOverride != null ? fadeOverride
+      : (track.chanceFadeMode === 'fade' ? track.chanceFadeDuration : 0.01);
 
     const ctx = this.engine.ctx;
     const now = ctx.currentTime;
     const t0 = whenTime ?? now;
 
-    const prevIntended = track._intendedGains[level] ?? 0;
+    const prevIntended = track._intendedGains[key] ?? (isShared ? track.volume : 0);
 
     // Scheduled at a future musical boundary. A play_chance change can land while a level
     // fade curve (activateLevel / _rampLevelGain) is still in flight on this same gain, so
     // split on whether such a fade's window straddles t0 (endTime read from _rampState — the
     // timing is exact even though its fromVal estimate is vestigial):
     if (t0 > now + 0.005) {
-      const rs = track._rampState[level];
+      const rs = track._rampState[key];
       const fadeCrossesT0 = !!(rs && rs.endTime > t0 + 1e-4);
       if (fadeCrossesT0) {
         // OVERLAP. The old `cancelScheduledValues(t0)` + `setValueAtTime(prevIntended, t0)`
@@ -3955,20 +4113,50 @@ class PFAEvent {
       // give negative progress if activateLevel runs before the boundary.
       // Store pending state separately so Conductor won't re-apply (fromVal is
       // bookkeeping only — never read for a gain decision; v0 reads live g.value).
-      track._pendingChanceGain = { level, targetVol, startTime: t0, endTime: t0 + fadeSec, fromVal: prevIntended };
+      if (isShared) {
+        // No activateLevel ever splices a shared lane: nothing consumes the
+        // pending record, so the intent is recorded at once.
+        track._intendedGains[key] = targetVol;
+        track._rampState[key] = { startTime: t0, endTime: t0 + fadeSec, fromVal: prevIntended, toVal: targetVol };
+      } else {
+        track._pendingChanceGain = { level, targetVol, startTime: t0, endTime: t0 + fadeSec, fromVal: prevIntended };
+      }
     } else {
       // Immediate (initial roll at play start)
       g.gain.cancelScheduledValues(now);
       g.gain.setValueAtTime(g.gain.value, now);
       g.gain.linearRampToValueAtTime(targetVol, now + fadeSec);
 
-      track._intendedGains[level] = targetVol;
-      track._rampState[level] = {
+      track._intendedGains[key] = targetVol;
+      track._rampState[key] = {
         startTime: now,
         endTime: now + fadeSec,
         fromVal: g.gain.value,
         toVal: targetVol,
       };
+    }
+  }
+
+  /**
+   * A level change applies the new level's chance verdict to every shared
+   * (all levels) lane over the transition's own fade — the preview switches a
+   * shared track's verdict with its level (its track state is kept per
+   * level). Called at the apply point of every level switch:
+   * the three transition kinds, the Fade Out's hand-over, the simple-mode
+   * crossfade. Godot parity: `_apply_shared_chance_for_level`.
+   */
+  _applySharedChanceForLevel(level, fd) {
+    for (let i = 0; i < this.tracks.length; i++) {
+      const track = this.tracks[i];
+      if (!(track.levelBehavior === 'always_play' || track.levelBehavior === 'level_conditional')) continue;
+      const st = this._trackChanceState?.[i];
+      if (!st || Object.keys(st).length === 0 || !track._trackGain) continue;
+      const verdict = this._levelChanceVerdict(i, level);
+      const target = verdict ? track.volume : 0;
+      const current = track._intendedGains['shared'] ?? track.volume;
+      if (Math.abs(target - current) > 1e-6) {
+        this._applyChanceGain(track, level, verdict, undefined, fd);
+      }
     }
   }
 
@@ -4095,22 +4283,31 @@ class PFAEvent {
 
   /**
    * Clip length (seconds) of the current node's level — used by free_tempo
-   * auto-advance where bars don't apply. First level_specific track's first
-   * clip wins. RegionClip.sourcePlayLength when present, else buffer.duration.
-   * Returns -1 if no playable clip found. Godot parity:
-   * `_get_current_clip_length_sec` (pfa_event.gd).
+   * auto-advance where bars don't apply. The first track, in track order,
+   * with a measurable clip answers: a level_specific track from its level
+   * pool (level 0 when the level has none), a shared (All levels) track from
+   * its variations. The clip WINDOW is what loops — `sourcePlayLength` when
+   * the clip has one, else the buffer past the clip's offset. Returns -1 if
+   * no playable clip found. Preview parity: `_get_clip_length_samples`;
+   * Godot parity: `_get_current_clip_length_sec`.
    */
   _getCurrentClipLengthSec() {
     const curLevel = this.currentLevel;
     for (const track of this.tracks) {
-      if (track.levelBehavior === 'always_play' || track.levelBehavior === 'level_conditional') continue;
-      const clips = track.levelClips?.[curLevel] ?? track.levelClips?.[0] ?? [];
-      if (clips.length > 0 && clips[0].sourcePlayLength > 0) {
-        return clips[0].sourcePlayLength;
+      const isShared = track.levelBehavior === 'always_play' || track.levelBehavior === 'level_conditional';
+      const clips = isShared
+        ? (track.sharedClips ?? [])
+        : (track.levelClips?.[curLevel] ?? track.levelClips?.[0] ?? []);
+      const buffers = isShared
+        ? track._sharedBuffers
+        : (track._buffers?.[curLevel] ?? track._buffers?.[0]);
+      const clip = clips.length > 0 ? clips[0] : null;
+      if (clip && clip.sourcePlayLength > 0) {
+        return clip.sourcePlayLength;
       }
-      const buffers = track._buffers?.[curLevel] ?? track._buffers?.[0];
       if (buffers && buffers.length > 0 && buffers[0]) {
-        return buffers[0].duration;
+        const len = buffers[0].duration - (clip?.sourceOffset ?? 0);
+        if (len > 0) return len;
       }
     }
     return -1;
@@ -4125,11 +4322,12 @@ class PFAEvent {
    * instead — authored intent is "this node ends with that fade, play it then stop".
    * Mirrors Godot `_schedule_auto_advance` (pfa_event.gd:724).
    */
-  _scheduleAutoAdvance(node) {
+  _scheduleAutoAdvance(node, entryTime = null) {
     if (this._autoAdvanceTimer) {
       clearTimeout(this._autoAdvanceTimer);
       this._autoAdvanceTimer = null;
     }
+    this._autoAdvanceAt = null;
 
     const loopCount = node.loop_count || 0;
     if (loopCount <= 0) return;
@@ -4156,19 +4354,27 @@ class PFAEvent {
 
     if (duration <= 0) return;
 
-    console.log(`[PFA] Auto-advance in ${duration.toFixed(3)}s (node=${this.currentNode}, loop_count=${loopCount}, free=${freeTempo}, terminal=${hasTerminal && !hasAuto})`);
+    // The endpoint counts from the section's authored entry (the boundary it
+    // was scheduled on, the endpoint that chose it, the Fade Out's hand-over)
+    // — so a chain of automatic sections holds the grid, and the route chosen
+    // there quantizes against the endpoint, not against the timer's lateness.
+    const now = this.engine._now();
+    const at = (entryTime ?? now) + duration;
+    this._autoAdvanceAt = at;
+
+    console.log(`[PFA] Auto-advance in ${Math.max(0, at - now).toFixed(3)}s (node=${this.currentNode}, loop_count=${loopCount}, free=${freeTempo}, terminal=${hasTerminal && !hasAuto})`);
 
     this._autoAdvanceTimer = setTimeout(() => {
       this._autoAdvanceTimer = null;
       if (hasAuto) {
-        this._executeAutoAdvance();
+        this._executeAutoAdvance(at);
       } else {
         this.stopWithTerminalFade();
       }
-    }, duration * 1000);
+    }, Math.max(0, at - now) * 1000);
   }
 
-  _executeAutoAdvance() {
+  _executeAutoAdvance(atTime = null) {
     if (!this.currentNode || !this.nodeGraph) return;
 
     // Find auto-transition connections from current node
@@ -4194,8 +4400,9 @@ class PFAEvent {
         console.log(`[PFA] Auto-advancing from "${this.currentNode}" to "${conn.target}"`);
         // onNodeChanged fires from _postTransitionCommon at the APPLY point —
         // reporting here would name the OLD node on the quantized/fade_out paths
-        // (and double-fire on the instant one).
-        this._executeTransition(conn);
+        // (and double-fire on the instant one). The route is dated at the
+        // endpoint of the repeats, whatever the timer's lateness.
+        this._executeTransition(conn, atTime);
         return;
       }
     }
@@ -4426,6 +4633,7 @@ class PFAEvent {
       // when the user picked Linear. Node-mode transitions already thread the curve.
       track.activateLevel(newLevel, this.fadeDuration, this.fadeCurve);
     }
+    this._applySharedChanceForLevel(newLevel, this.fadeDuration);
   }
 
   _cleanupVoices() {
@@ -4610,14 +4818,22 @@ class PFATrack {
     }
   }
 
-  triggerSfx(level, destination, iv = null) {
+  /**
+   * Fire one flat (non-positioned) SFX voice for this track. Honors the event's
+   * authored loop the way `triggerSfxSpatial` does — `seamless` loops the ONE
+   * variation natively over its clip window; `smart` plays one pass and the
+   * event re-triggers the track a cycle later (`_scheduleFlatReloop`), the seam
+   * owning the crossfade; a one_shot clip never loops. `skipPlayChance` is the
+   * smart re-loop's spawn (the first trigger rolled it).
+   */
+  triggerSfx(level, destination, iv = null, skipPlayChance = false) {
     // always_play / level_conditional keep their samples in the shared pool, so
     // levelSamples is empty for them — only gate level_specific on missing level data.
     const isShared = this.levelBehavior === 'always_play' || this.levelBehavior === 'level_conditional';
     if (!isShared && !this.levelSamples[level] && !this.levelSamples[0]) return null;
 
     // Play chance
-    if (!this._rollPlayChance(level)) return null;
+    if (!skipPlayChance && !this._rollPlayChance(level)) return null;
 
     const { buffer, clip, variation, variationCount } = this._getBufferAndClip(level, true);
     if (!buffer) return null;
@@ -4627,7 +4843,17 @@ class PFATrack {
     const ctx = this.engine.ctx;
     const source = ctx.createBufferSource();
     source.buffer = buffer;
-    source.loop = false;
+    // Loop resolution — the same rule as the spatial voice: the event's
+    // authored `loop` (SFX) is the control; a music-type event loops by nature;
+    // a one_shot clip never loops; a plain one-shot stays single-shot.
+    const ev = this._parentEvent;
+    const lcfg = ev && ev.loop;
+    let loopMode = null;
+    if (lcfg && lcfg.enabled) loopMode = lcfg.mode === 'smart' ? 'smart' : 'seamless';
+    else if (ev && ev.type === 'music') loopMode = 'seamless';
+    if (loopMode && !(clip && clip.loopMode !== 'one_shot')) loopMode = null;
+    const loopSeamless = loopMode === 'seamless';
+    source.loop = loopSeamless;
 
     this._applySfxPitchRate(source, iv);
 
@@ -4644,7 +4870,16 @@ class PFATrack {
     const offset = clip ? clip.sourceOffset : 0;
     const hasWindow = clip && clip.sourcePlayLength > 0;
     const playLen = hasWindow ? clip.sourcePlayLength : Math.max(0, buffer.duration - offset);
-    if (hasWindow) {
+    if (loopSeamless) {
+      // Loop [offset, offset+playLen) forever. No duration arg (it would stop
+      // the source after one pass); loopStart/loopEnd keep the window seamless.
+      if (hasWindow) {
+        source.loopStart = offset;
+        source.loopEnd = offset + clip.sourcePlayLength;
+      }
+      source.start(startTime, offset);
+    } else if (hasWindow) {
+      // One-shot trim — also the per-cycle pass of a 'smart' loop.
       source.start(startTime, offset, clip.sourcePlayLength);
     } else if (offset > 0) {
       source.start(startTime, offset);
@@ -4652,7 +4887,15 @@ class PFATrack {
       source.start(startTime);
     }
 
-    this._applySfxFadeEnvelope(voiceGain.gain, target, startTime, playLen, clip);
+    if (loopMode === 'smart') {
+      // The re-trigger scheduler owns the seam (crossfade), so the voice plays
+      // at full gain — a clip fade-in/out here would fight the crossfade.
+      voiceGain.gain.setValueAtTime(target, startTime);
+    } else {
+      // seamless / one-shot: clip fade envelope. 'looping' suppresses the
+      // window-end fade-out (it would mute a seamless loop after the first pass).
+      this._applySfxFadeEnvelope(voiceGain.gain, target, startTime, playLen, clip, loopSeamless);
+    }
 
     source.connect(voiceGain);
     voiceGain.connect(this._trackGain);
@@ -4678,6 +4921,18 @@ class PFATrack {
     let releasing = false;
     return {
       stop: () => { try { source.stop(); } catch(e) {} },
+      // The smart seam: ramp this voice to silence over `seconds` and stop it.
+      fadeStop: (seconds) => {
+        if (releasing) return;
+        releasing = true;
+        try {
+          const t0 = this.engine._now();
+          voiceGain.gain.cancelScheduledValues(t0);
+          voiceGain.gain.setValueAtTime(Math.min(voiceGain.gain.value, target), t0);
+          voiceGain.gain.linearRampToValueAtTime(0, t0 + seconds);
+          setTimeout(() => { try { source.stop(); } catch(e) {} }, seconds * 1000 + 10);
+        } catch(e) { try { source.stop(); } catch(e2) {} }
+      },
       // Click-free steal: leave the pool at once (isActive false frees the cap
       // slot), ramp the voice gain to silence over the anti-click seam, and let
       // the source stop itself (single-owner rule — no hard cut mid-waveform).
@@ -4704,6 +4959,12 @@ class PFATrack {
       variationCount,
       algo: this.randomizationAlgo,
       sample,
+      // Loop bookkeeping for the event's smart re-loop scheduler.
+      loopMode,
+      clipLen: playLen,
+      _voiceGain: voiceGain,
+      _target: target,
+      _reloopTimer: null,
     };
   }
 
@@ -5815,7 +6076,7 @@ class PFALiveConnect {
 }
 
 /** Engine version (also sent in the Live Connect hello). */
-PFA.VERSION = '1.16.3';
+PFA.VERSION = '1.16.4';
 
 // Browser global
 if (typeof window !== 'undefined') {
