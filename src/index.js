@@ -2440,6 +2440,8 @@ class PFA {
       next._voiceGain.gain.setValueAtTime(0, now);
       next._voiceGain.gain.linearRampToValueAtTime(tgt, now + CROSS);
       voice.stop(CROSS * 1000);
+      // The pool keeps only what still plays — see _scheduleFlatReloop.
+      event._cleanupVoices();
     }, period);
   }
 
@@ -2481,6 +2483,8 @@ class PFA {
         // Silent slot — the previous one-shot voice finishes out naturally.
         ctrl.active = null;
       }
+      // The pool keeps only what still plays — see _scheduleFlatReloop.
+      event._cleanupVoices();
       // Next slot = one clip length (the last PLAYED clip sets the rhythm).
       ctrl.timer = setTimeout(tick, Math.max(0.05, ctrl.lastClipLen - CROSS) * 1000);
     };
@@ -3104,6 +3108,9 @@ class PFAEvent {
    * (the voice reads inactive at the tick) — and stop() clears the timer. The
    * spatial twin is `_scheduleSmartReloop`; the Godot addon's flat twin is
    * `_flat_smart_tick`. The first trigger rolled play_chance; a cycle does not.
+   * Each tick prunes the event's pool of the voices it has released: the pool
+   * is otherwise pruned only by the next trigger, and a loop re-triggers
+   * itself for as long as it runs.
    */
   _scheduleFlatReloop(voice, track, iv) {
     const CROSS = 0.08;   // 80 ms crossfade seam
@@ -3120,6 +3127,7 @@ class PFAEvent {
       next._voiceGain.gain.setValueAtTime(0, now);
       next._voiceGain.gain.linearRampToValueAtTime(tgt, now + CROSS);
       voice.fadeStop(CROSS);
+      this._cleanupVoices();
       this._scheduleFlatReloop(next, track, iv);
     }, period);
   }
@@ -6076,7 +6084,7 @@ class PFALiveConnect {
 }
 
 /** Engine version (also sent in the Live Connect hello). */
-PFA.VERSION = '1.16.4';
+PFA.VERSION = '1.16.5';
 
 // Browser global
 if (typeof window !== 'undefined') {

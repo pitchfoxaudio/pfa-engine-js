@@ -1,6 +1,6 @@
 {
   "name": "pfa-engine",
-  "version": "1.16.4",
+  "version": "1.16.5",
   "description": "PitchFox Audio Engine — adaptive music & SFX for web games. Web Audio API based.",
   "type": "module",
   "main": "src/index.js",
