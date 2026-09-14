@@ -719,6 +719,15 @@ class PFA {
     /** @private */ this._decodeLRU = [];        // [ filePath, ... ] — most recently used at end
     /** @private */ this._memoryBudgetBytes = Infinity; // default: no eviction (backward compat)
     /** @private */ this._decodedBytes = 0;      // current total decoded PCM bytes in cache
+    /** @private */ this._decodePending = {};    // { filePath: Promise<AudioBuffer> } — decodes in
+                                                 // flight, so concurrent requests for one path
+                                                 // share a single fetch + decode
+    /** @private */ this._loadGen = 0;           // cache generation — bumped by every pack
+                                                 // commit and by clearAudioCaches(). A fetch
+                                                 // or decode that started under an older
+                                                 // value resolves for its caller but must
+                                                 // not write into these caches (see
+                                                 // _getAudioBuffer / _decodeWithCache)
 
     // Reverb (algorithmic Freeverb send-bus) — built lazily from
     // config.reverb_zones; null when the pack ships no zones (zero behaviour change).
@@ -1284,6 +1293,17 @@ class PFA {
     this._decodeCache = {};
     this._decodeLRU = [];
     this._decodedBytes = 0;
+    // A request made after this commit must not join a decode that started
+    // before it — that decode belongs to the outgoing pack.
+    this._decodePending = {};
+    // Clean caches are not enough: a fetch or decode still in flight from the
+    // outgoing generation (a preloadAll() that a Live Connect reload interrupted)
+    // finishes AFTER this commit and used to land in these fresh caches under
+    // the very path the new pack reuses — the new generation then served the
+    // old bytes, and the reload callback had already reported success. The two
+    // cache writers compare this counter after every await and skip the write
+    // when it moved.
+    this._loadGen++;
     this.groups = groups;
     this.events = events;
 
@@ -1316,7 +1336,10 @@ class PFA {
 
   /**
    * Get compressed audio ArrayBuffer for a file path.
-   * Returns a COPY suitable for decodeAudioData (which detaches the buffer).
+   * Returns bytes safe to hand to decodeAudioData (which detaches the buffer):
+   * a COPY of the stored bytes, or — when a pack commit or a cache flush
+   * happened during the fetch — the fetched buffer itself, which is then NOT
+   * stored (nothing else references it, so no copy is needed).
    * Stores the original compressed bytes in _assetStore for future re-decode.
    * @param {string} filePath - relative audio path (e.g. "music/foo.ogg")
    * @returns {Promise<ArrayBuffer>}
@@ -1327,6 +1350,13 @@ class PFA {
     if (this._assetStore[filePath]) {
       return this._assetStore[filePath].slice(0);
     }
+
+    // The generation this request belongs to. A pack commit or a cache flush
+    // while the fetch below is in flight moves the counter: the bytes still go
+    // to the caller (it asked under the old generation and gets what it asked
+    // for), but they must not enter the store the NEW generation reads — the
+    // store is keyed by path and the new pack reuses the path.
+    const gen = this._loadGen;
 
     // Fetch compressed bytes
     let raw;
@@ -1340,6 +1370,10 @@ class PFA {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       raw = await response.arrayBuffer();
     }
+
+    // Stale: the pack these bytes were fetched for is gone (or its caches were
+    // flushed). Hand them to the caller, keep them out of the store.
+    if (gen !== this._loadGen) return raw;
 
     // Store compressed bytes for future re-decode (LRU eviction + re-load)
     this._assetStore[filePath] = raw;
@@ -1367,12 +1401,19 @@ class PFA {
    * (nothing rewrites a bank under the engine) and _bankBuffer may already be
    * released, so dropping the store would strand every future re-decode.
    * Playing voices are unaffected — they hold their own buffer references.
+   * A decode already in flight resolves for its caller but does not refill
+   * the flushed caches when it finishes.
    */
   clearAudioCaches() {
     if (!this._bankMode) this._assetStore = {};
     this._decodeCache = {};
     this._decodeLRU = [];
     this._decodedBytes = 0;
+    this._decodePending = {};
+    // Same door as a pack commit: work that started before the flush must not
+    // repopulate the caches with pre-flush bytes, and a request made after it
+    // must not join such work.
+    this._loadGen++;
   }
 
   // ── Decode Cache + LRU Memory Management ─────────────────────────────
@@ -1391,9 +1432,42 @@ class PFA {
       return this._decodeCache[filePath];
     }
 
-    // Decode from compressed bytes
+    // One decode per path per generation. A second request for a path whose
+    // decode is in flight joins it instead of fetching and decoding again —
+    // two quick plays of a not-yet-loaded event, or a reload's preload
+    // overlapping the boot preload it replaced. Two independent decodes of
+    // one path both wrote the cache, and the byte counter and the LRU counted
+    // the path twice; the second LRU entry could never be subtracted back.
+    const pending = this._decodePending[filePath];
+    if (pending) return pending;
+    const decode = this._decodeUncached(filePath);
+    this._decodePending[filePath] = decode;
+    try {
+      return await decode;
+    } finally {
+      if (this._decodePending[filePath] === decode) delete this._decodePending[filePath];
+    }
+  }
+
+  /**
+   * Fetch + decode one file and, if the generation it was asked for is still
+   * the current one, install the result in the decode cache.
+   * @param {string} filePath - relative audio path
+   * @returns {Promise<AudioBuffer>}
+   * @private
+   */
+  async _decodeUncached(filePath) {
+    const gen = this._loadGen;
     const raw = await this._getAudioBuffer(filePath);
     const audioBuffer = await this.ctx.decodeAudioData(raw);
+
+    // A pack commit or a cache flush happened while this decode was in flight:
+    // the caller belongs to the generation that asked and gets its buffer, but
+    // the cache, the LRU and the byte counter belong to the NEW generation.
+    // Writing here would hand the new pack the old audio under its own path
+    // (Sync rewrites exported files under the same names) and count the PCM
+    // bytes twice.
+    if (gen !== this._loadGen) return audioBuffer;
 
     // Store in decode cache
     const pcmBytes = audioBuffer.length * audioBuffer.numberOfChannels * 4; // Float32
@@ -6084,7 +6158,7 @@ class PFALiveConnect {
 }
 
 /** Engine version (also sent in the Live Connect hello). */
-PFA.VERSION = '1.16.5';
+PFA.VERSION = '1.16.6';
 
 // Browser global
 if (typeof window !== 'undefined') {
