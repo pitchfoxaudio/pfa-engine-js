@@ -92,7 +92,7 @@ It's an explicit opt-in (not automatic in `loadPack()`) so bigger games keep per
 
 ### Many-room game: `preloadGroup()` per area
 
-Don't `preloadAll()` a big game. Author events into **groups per area/room** in Studio, keep a small "common" group warm (UI, player, footsteps), and preload a room's group when the player enters. Unused decoded audio is evicted automatically under the memory budget (below) — there is no manual unload on web.
+Don't `preloadAll()` a big game. Author events into **groups per area/room** in Studio, keep a small "common" group warm (UI, player, footsteps), and preload a room's group when the player enters. Unused decoded audio is evicted automatically under the memory budget (below); by hand, `pfa.events[name].unloadBuffers()` releases one event's decoded audio and `pfa.clearAudioCaches()` flushes every loose decoded and compressed cache at once (a loaded bank's bytes stay).
 
 ```javascript
 await pfa.preloadGroup('forest');   // on room enter
@@ -141,6 +141,7 @@ Browsers expand compressed audio ~20× when decoding (1 MB OGG → ~60 MB PCM), 
 | `pfa.loadPack(url)` | Load `config.json` + set up events (no audio decoded yet) — resolves `true`/`false` |
 | `pfa.loadBank(url)` | Load a `.pfabank` binary bank (single fetch), same API after load — resolves `true`/`false` |
 | `pfa.releaseBankBuffer()` | Free the raw bank ArrayBuffer after preloading |
+| `pfa.clearAudioCaches()` | Flush every loose decoded and compressed cache (a loaded bank's bytes stay); a request made after the flush fetches fresh bytes and never joins a decode still in flight |
 | `pfa.preload(event)` | Decode one event's audio |
 | `pfa.preloadGroup(group)` | Decode all events in a group |
 | `pfa.preloadAll(options?)` | Decode everything (batched; see Loading above) |
@@ -164,7 +165,7 @@ Browsers expand compressed audio ~20× when decoding (1 MB OGG → ~60 MB PCM), 
 
 | Method | Description |
 |--------|-------------|
-| `pfa.navigate(event, trigger)` | Fire a transition by trigger name — returns `true` when the request was accepted: a route with that trigger leaves the current node (or, with none, a node carries the trigger and the first road out is taken) and the probability roll passed. `true` means scheduled, not yet applied — `onNodeChanged` marks the apply |
+| `pfa.navigate(event, trigger)` | Fire a transition by trigger name — returns `true` when the request was accepted. A route carrying that trigger out of the current node is ranked with its siblings and rolled: `true` means its probability roll passed. With no such route, a node that carries the trigger is entered directly and nothing is rolled — the fade settings are borrowed from the first road leaving the current node, or are the event's own when none does. `true` means scheduled, not yet applied — `onNodeChanged` marks the apply |
 | `pfa.getCurrentNode(event)` | Current node ID (or `null`) |
 | `pfa.toggleSubLevel(event, name, enabled, fade = 0.5)` | Toggle a sub-level layer on/off with a fade |
 
@@ -174,7 +175,7 @@ Node graph activates when the config has `use_nodes: true`. The engine enters th
 
 | Method | Description |
 |--------|-------------|
-| `pfa.trigger(event, options?)` | Trigger a one-shot SFX. `options.intensity` (0..1) = per-trigger hit strength (see Intensity). **async** — fire and forget, or `await` it for `played[]`: one entry per track that fired, `{ track, behavior, variation, variationCount, algo, sample }` |
+| `pfa.trigger(event, options?)` | Trigger an SFX event. A plain event plays once; an event authored with a Loop (Studio's seamless or smart setting) plays until `stop()` — a `one_shot` clip plays once whatever the event says. `options.intensity` (0..1) = per-trigger hit strength (see Intensity). **async** — fire and forget, or `await` it for `played[]`: one entry per track that fired, `{ track, behavior, variation, variationCount, algo, sample }` |
 
 Cooldown (`cooldown_ms`) and voice cap (`max_instances`: the least audible voice is stolen — quietest first, oldest on a tie — and a new trigger quieter than every live voice is rejected; see Voice management) are authored per event in Studio and enforced by the engine. `always_play` layers fire on every level; each fired layer picks a fresh sample variation (switch_chance-gated) with clip trim + fades applied.
 

@@ -2497,6 +2497,7 @@ class PFA {
    */
   _scheduleSmartReloop(voice, event, track, cfg, is3D, releaseMs, emitter, iv = null) {
     const CROSS = 0.08; // 80 ms crossfade seam
+    // _clipLen is the cycle in wall seconds (the voice's playback rate folded in).
     const period = Math.max(0.05, (voice._clipLen || 0) - CROSS) * 1000;
     voice._reloopTimer = setTimeout(() => {
       voice._reloopTimer = null;
@@ -3188,6 +3189,7 @@ class PFAEvent {
    */
   _scheduleFlatReloop(voice, track, iv) {
     const CROSS = 0.08;   // 80 ms crossfade seam
+    // clipLen is the cycle in wall seconds (the voice's playback rate folded in).
     const period = Math.max(0.05, (voice.clipLen || 0) - CROSS) * 1000;
     voice._reloopTimer = setTimeout(() => {
       voice._reloopTimer = null;
@@ -4938,6 +4940,11 @@ class PFATrack {
     source.loop = loopSeamless;
 
     this._applySfxPitchRate(source, iv);
+    // The voice's clock: playbackRate stretches every buffer second into 1/rate
+    // wall seconds. The clip window, its fades and the smart re-loop cycle are
+    // all measured on that wall clock below — Studio's preview fades the clip and
+    // then resamples it, the Godot addon divides its cycle by pitch_scale.
+    const rate = (source.playbackRate && source.playbackRate.value > 0) ? source.playbackRate.value : 1.0;
 
     // Per-voice gain isolates clip volume + fades from the shared _trackGain
     // (track volume stays on _trackGain). Each voice is independent, so overlapping
@@ -4976,7 +4983,7 @@ class PFATrack {
     } else {
       // seamless / one-shot: clip fade envelope. 'looping' suppresses the
       // window-end fade-out (it would mute a seamless loop after the first pass).
-      this._applySfxFadeEnvelope(voiceGain.gain, target, startTime, playLen, clip, loopSeamless);
+      this._applySfxFadeEnvelope(voiceGain.gain, target, startTime, playLen, clip, loopSeamless, rate);
     }
 
     source.connect(voiceGain);
@@ -5041,9 +5048,10 @@ class PFATrack {
       variationCount,
       algo: this.randomizationAlgo,
       sample,
-      // Loop bookkeeping for the event's smart re-loop scheduler.
+      // Loop bookkeeping for the event's smart re-loop scheduler: clipLen is the
+      // cycle in WALL seconds (the playback rate folded in).
       loopMode,
-      clipLen: playLen,
+      clipLen: playLen / rate,
       _voiceGain: voiceGain,
       _target: target,
       _reloopTimer: null,
@@ -5096,6 +5104,11 @@ class PFATrack {
     source.loop = loopSeamless;
 
     this._applySfxPitchRate(source, iv);
+    // The voice's clock: playbackRate stretches every buffer second into 1/rate
+    // wall seconds. The clip window, its fades and the smart re-loop cycle are
+    // all measured on that wall clock below — Studio's preview fades the clip and
+    // then resamples it, the Godot addon divides its cycle by pitch_scale.
+    const rate = (source.playbackRate && source.playbackRate.value > 0) ? source.playbackRate.value : 1.0;
 
     const target = this.volume * (clip?.volume ?? 1.0) * this._volumeRandLinear() * (iv ? iv.gainMult : 1.0);
 
@@ -5129,15 +5142,16 @@ class PFATrack {
     } else {
       // seamless / one-shot: clip fade envelope. 'looping' suppresses the window-end
       // fade-out (it would mute a seamless loop after the first pass).
-      this._applySfxFadeEnvelope(voiceGain.gain, target, startTime, playLen, clip, loopSeamless);
+      this._applySfxFadeEnvelope(voiceGain.gain, target, startTime, playLen, clip, loopSeamless, rate);
     }
 
     source.connect(voiceGain);
     this._sources.push(source);
 
     // onended is set by the PFASpatialVoice ctor (also handles _sources cleanup).
-    // loopMode/clipLen/target let triggerSpatial schedule the 'smart' re-loop.
-    return { source, voiceGain, track: this, loopMode, clipLen: playLen, target };
+    // loopMode/clipLen/target let triggerSpatial schedule the 'smart' re-loop;
+    // clipLen is the cycle in WALL seconds (the playback rate folded in).
+    return { source, voiceGain, track: this, loopMode, clipLen: playLen / rate, target };
   }
 
   crossfadeToLevel(newLevel, duration, destination, elapsedSeconds = 0) {
@@ -5709,12 +5723,19 @@ class PFATrack {
    * @param {AudioParam} gainParam  the per-voice gain's .gain param
    * @param {number} target         steady-state amplitude (track/clip volume x volume-rand)
    * @param {number} startTime      scheduled source start (ctx time, incl. delay randomization)
-   * @param {number} playLen        playback window length in seconds
+   * @param {number} playLen        playback window length in BUFFER seconds
+   * @param {number} rate           the voice's playback rate — the window and the
+   *                                clip fades are converted to the wall clock by it
    * @param {object|null} clip      parsed clip (fadeIn/fadeOut in seconds), may be null
    */
-  _applySfxFadeEnvelope(gainParam, target, startTime, playLen, clip, looping = false) {
-    let fadeIn = clip ? (clip.fadeIn || 0) : 0;
-    let fadeOut = clip ? (clip.fadeOut || 0) : 0;
+  _applySfxFadeEnvelope(gainParam, target, startTime, playLen, clip, looping = false, rate = 1) {
+    // Buffer seconds → wall seconds: the window and both fades stretch with the
+    // voice's playback rate, so the fade-out ends exactly where the source ends
+    // (a voice pitched up used to end before its fade-out began; a voice pitched
+    // down went silent with half its sound still to play).
+    playLen = playLen / rate;
+    let fadeIn = (clip ? (clip.fadeIn || 0) : 0) / rate;
+    let fadeOut = (clip ? (clip.fadeOut || 0) : 0) / rate;
     // Looping spatial ambience: the window-end fade-out would mute the loop after
     // one pass, so drop it (the fade-in still applies once at start).
     if (looping) fadeOut = 0;
@@ -6158,7 +6179,7 @@ class PFALiveConnect {
 }
 
 /** Engine version (also sent in the Live Connect hello). */
-PFA.VERSION = '1.16.6';
+PFA.VERSION = '1.16.7';
 
 // Browser global
 if (typeof window !== 'undefined') {
