@@ -3410,6 +3410,14 @@ class PFAEvent {
     if (!this._eventGain) return;
     // A smart flat loop must not spawn its next pass behind the fade.
     this._stopFlatLoops();
+    // An event fading out to stop no longer moves its graph: the section's
+    // pending auto-advance would start a second (terminal) fade behind this
+    // one, or walk to the next section under the release.
+    if (this._autoAdvanceTimer) {
+      clearTimeout(this._autoAdvanceTimer);
+      this._autoAdvanceTimer = null;
+    }
+    this._autoAdvanceAt = null;
     this._tweenEventGain(0.0001, duration, curve);
 
     if (this._fadeOutTimer) clearTimeout(this._fadeOutTimer);
@@ -4452,8 +4460,10 @@ class PFAEvent {
       this._autoAdvanceTimer = null;
       if (hasAuto) {
         this._executeAutoAdvance(at);
-      } else {
-        this.stopWithTerminalFade();
+      } else if (this.stopWithTerminalFade()) {
+        // The graph ended the music by itself — announced like stopTerminal(),
+        // as the fade starts.
+        this.engine.onEventStopped?.(this.name);
       }
     }, Math.max(0, at - now) * 1000);
   }
@@ -6179,7 +6189,7 @@ class PFALiveConnect {
 }
 
 /** Engine version (also sent in the Live Connect hello). */
-PFA.VERSION = '1.16.7';
+PFA.VERSION = '1.16.8';
 
 // Browser global
 if (typeof window !== 'undefined') {

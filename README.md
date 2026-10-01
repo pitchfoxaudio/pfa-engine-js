@@ -197,7 +197,10 @@ Volume chain: `clip × track × event × group × master` — all linear, each s
 
 ```javascript
 pfa.onEventStarted    = (name) => {};
-pfa.onEventStopped    = (name) => {};
+pfa.onEventStopped    = (name) => {};                  // stop() / stopTerminal() / another music
+                                                       // event taking over, or the node graph itself
+                                                       // when a section's last repeat runs into its
+                                                       // terminal_fade (called as the fade starts)
 pfa.onLevelChanged    = (name, level) => {};
 pfa.onSfxTriggered    = (name, played) => {};          // an SFX actually fired — not called for a
                                                        // refused trigger (cooldown / cap / chance);
