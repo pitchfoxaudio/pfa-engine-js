@@ -2,7 +2,7 @@
 
 **PitchFox Audio Engine** — adaptive music & SFX runtime for web games, built on the Web Audio API.
 
-It plays audio projects authored in **PFA Studio** (the desktop editor): Studio exports a `config.json` + audio files (or a single `.pfabank`), the engine loads and performs them — adaptive music levels, node-graph transitions, randomized SFX, spatial voices, reverb zones. The same export drives the [PFA Engine for Godot](https://github.com/pitchfoxaudio/pfa-engine-godot); design once, ship on both.
+It plays audio projects authored in **PFA Studio** (the desktop editor): Studio exports a `config.json` + audio files (or a single `.pfabank`), the engine loads and performs them — adaptive music levels, node-graph transitions, randomized SFX, spatial voices, reverb zones. The same export drives the [PFA Engine for Godot](https://github.com/pitchfoxaudio/pfa-engine-godot) (also on the [Godot Asset Store](https://store.godotengine.org/asset/pitchfoxaudio/pfa-engine/)); design once, ship on both.
 
 - Engine version **1.16.x** · config schema **v1.1** · zero dependencies · MIT
 - Part of the **PFA suite** — all components: [github.com/pitchfoxaudio](https://github.com/pitchfoxaudio)
